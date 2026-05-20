@@ -1,0 +1,23 @@
+# Virtual Environment
+venv/
+.venv/
+venv310/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build files
+dist/
+build/
