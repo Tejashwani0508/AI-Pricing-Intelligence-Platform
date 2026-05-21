@@ -916,14 +916,16 @@ def render_pricing_engine() -> None:
     page_hdr("Pricing Engine", "Optimal price recommendations and financial impact.")
     df = require_data(prefer_analyzed=True)
     if df is None or "optimal_price" not in df.columns: st.warning("Run full analysis first."); return
-    cr = numcol(df, "revenue").sum(); er = numcol(df, "expected_revenue").sum()
-    cpt = ((numcol(df, "current_price") - numcol(df, "cost_price")) * numcol(df, "sales_volume")).sum()
+    er = numcol(df, "expected_revenue").sum()
     ep = numcol(df, "expected_profit").sum()
+    avg_margin_val = float(df.get("profit_margin", pd.Series([0])).mean()) * 100
+    high_risk_count = int((df.get("risk_level", pd.Series(dtype=str)).isin(["HIGH", "CRITICAL"])).sum()) if "risk_level" in df.columns else 0
+    inc_count = int((df.get("recommendation", pd.Series(dtype=str)) == "Increase").sum()) if "recommendation" in df.columns else 0
     cols = st.columns(4)
-    safe_metric(cols[0], "Revenue Lift", fmt_money(er - cr))
-    safe_metric(cols[1], "Expected Revenue", fmt_money(er))
-    safe_metric(cols[2], "Profit Lift", fmt_money(ep - cpt))
-    safe_metric(cols[3], "Avg Change", f"{numcol(df,'price_change_pct').mean():+.1f}%")
+    safe_metric(cols[0], "Projected Revenue", fmt_money(er))
+    safe_metric(cols[1], "Profit", fmt_money(ep))
+    safe_metric(cols[2], "Avg Margin", f"{avg_margin_val:.1f}%")
+    safe_metric(cols[3], "High Risk", f"{high_risk_count:,}")
     l, r = st.columns(2)
     for col, fn in [(l, viz.create_price_vs_optimal_scatter), (r, viz.create_recommendation_pie)]:
         with col:
