@@ -107,11 +107,16 @@ def inject_css() -> None:
         }
 
         .block-container {
-            padding: 1.5rem 1.65rem 1.25rem !important;
+            padding: 2.5rem 1.65rem 1.25rem !important;
             max-width: 100% !important;
             overflow: visible !important;
         }
         .main .block-container { overflow: visible !important; }
+        
+        /* Ensure top spacing to prevent Streamlit header overlap */
+        div[data-testid="stAppViewContainer"] {
+            padding-top: 20px !important;
+        }
 
         #MainMenu, footer { visibility: hidden; display: none; }
 
@@ -191,10 +196,12 @@ def inject_css() -> None:
             background: #FFFFFF;
             border: 1px solid #E5E7EB;
             border-radius: 14px;
-            padding: 16px 18px;
+            padding: 16px 14px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.04);
             transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
             height: 100%;
+            width: 100%;
+            overflow: hidden;
         }
         div[data-testid="stMetric"]:hover {
             box-shadow: 0 4px 16px rgba(0,0,0,0.08);
@@ -202,11 +209,26 @@ def inject_css() -> None:
             transform: translateY(-1px);
         }
         div[data-testid="stMetric"] label {
-            color: var(--slate-500); font-size: 0.69rem; font-weight: 800;
+            color: var(--slate-500); font-size: 0.65rem; font-weight: 800;
             text-transform: uppercase; letter-spacing: 0.06em;
+            margin-bottom: 6px;
+            display: block;
+            word-wrap: break-word;
+            overflow: visible;
+            white-space: normal;
         }
         div[data-testid="stMetric"] > div:first-child {
-            font-weight: 800; color: var(--slate-950); font-size: 1.38rem !important;
+            font-weight: 800; color: var(--slate-950); font-size: 1.25rem !important;
+            word-wrap: break-word;
+            overflow: visible;
+            white-space: normal;
+            text-overflow: clip;
+        }
+        div[data-testid="stMetric"] > div:nth-child(2) {
+            font-size: 0.75rem !important;
+            word-wrap: break-word;
+            overflow: visible;
+            white-space: normal;
         }
         div[data-testid="stMetric"] svg { display: none; }
 
@@ -379,6 +401,11 @@ def inject_css() -> None:
         .row-widget { overflow: visible !important; }
         .stMarkdown { overflow: visible !important; }
         .stPlotlyChart { overflow: visible !important; }
+        .stPlotlyChart > div { width: 100% !important; }
+        div[data-testid="stHorizontalBlock"] {
+            gap: 0.85rem;
+            align-items: stretch;
+        }
 
         /* Chat formatting */
         .chat-section-header {
@@ -455,6 +482,9 @@ def get_df(prefer_analyzed: bool = True) -> Optional[pd.DataFrame]:
     return st.session_state.raw_df
 
 def set_dataset(df: pd.DataFrame, rpt: dict, src: str) -> None:
+    if df is None or df.empty:
+        st.warning("No data available.")
+        return
     st.session_state.raw_df = st.session_state.processed_df = df.copy()
     st.session_state.analyzed_df = None
     st.session_state.processor_report = rpt
@@ -466,15 +496,26 @@ def set_dataset(df: pd.DataFrame, rpt: dict, src: str) -> None:
     st.session_state.assistant.clear_history()
 
 def ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
     out = df.copy()
+    for c in ["current_price", "cost_price", "competitor_price", "sales_volume", "inventory_level", "demand_trend", "price_elasticity"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
     if "competitor_price" not in out.columns and "current_price" in out.columns:
         out["competitor_price"] = out["current_price"] * 1.05
     for c, d in [("sales_volume", 100), ("inventory_level", 500), ("demand_trend", 0.5), ("price_elasticity", -1.5)]:
-        if c not in out.columns: out[c] = d
+        if c not in out.columns:
+            out[c] = d
+        else:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(d)
     if "category" not in out.columns: out["category"] = "Uncategorized"
-    if "product_name" not in out.columns: out["product_name"] = out.get("product_id", pd.Series(range(len(out)))).astype(str)
+    else: out["category"] = out["category"].fillna("Uncategorized").astype(str)
+    if "product_name" not in out.columns: out["product_name"] = out.get("product_id", pd.Series(range(len(out)), index=out.index)).astype(str)
+    else: out["product_name"] = out["product_name"].fillna("").astype(str)
     if "profit_margin" not in out.columns and {"current_price", "cost_price"}.issubset(out.columns):
-        out["profit_margin"] = ((out["current_price"] - out["cost_price"]) / out["current_price"]).clip(lower=0)
+        denom = out["current_price"].replace(0, pd.NA)
+        out["profit_margin"] = ((out["current_price"] - out["cost_price"]) / denom).fillna(0).clip(lower=0)
     if "revenue" not in out.columns and {"current_price", "sales_volume"}.issubset(out.columns):
         out["revenue"] = out["current_price"] * out["sales_volume"]
     if "price_vs_competitor" not in out.columns and {"current_price", "competitor_price"}.issubset(out.columns):
@@ -482,8 +523,21 @@ def ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def numcol(df: pd.DataFrame, c: str, d: float = 0.0) -> pd.Series:
+    if df is None:
+        return pd.Series(dtype="float64")
     if c not in df.columns: return pd.Series([d] * len(df), index=df.index, dtype="float64")
-    return pd.to_numeric(df[c], errors="coerce").fillna(d)
+    return pd.to_numeric(df[c], errors="coerce").replace([float("inf"), float("-inf")], pd.NA).fillna(d)
+
+def safe_sort(df: pd.DataFrame, col: str, ascending: bool = True) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty or col not in df.columns:
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    out = df.copy()
+    if pd.api.types.is_numeric_dtype(out[col]):
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+    else:
+        numeric = pd.to_numeric(out[col], errors="coerce")
+        out[col] = numeric.fillna(0) if numeric.notna().any() else out[col].fillna("").astype(str)
+    return out.sort_values(col, ascending=ascending)
 
 def build_insights(df: pd.DataFrame) -> Dict[str, Any]:
     if df is None or df.empty: return {}
@@ -526,6 +580,9 @@ def run_batch(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any], List[Dict
     pr = st.progress(0, text="Preparing products")
     rpts: Dict[str, Any] = {}
     w = ensure_cols(df)
+    if w.empty:
+        pr.empty()
+        raise ValueError("No data available for analysis.")
     try:
         with st.spinner("Forecasting demand..."):
             fd = DemandForecaster(max_workers=st.session_state.max_workers)
@@ -578,26 +635,93 @@ def safe_chart(fn, *a, **kw) -> Optional[go.Figure]:
     """Return a Plotly figure, or None if it fails — caller handles None."""
     try:
         fig = fn(*a, **kw)
-        if fig is not None and hasattr(fig, 'data') and len(fig.data) > 0:
-            # Check that data actually has values
-            has_valid = False
-            for t in fig.data:
-                if hasattr(t, 'x') and t.x is not None and len(t.x) > 0:
-                    has_valid = True
+        if fig is None:
+            return None
+        
+        # Validate figure has actual data (not just empty annotations)
+        if hasattr(fig, 'data') and len(fig.data) > 0:
+            # Check that data traces actually have values
+            has_valid_data = False
+            for trace in fig.data:
+                # Check for x/y values (bar, scatter, line)
+                if hasattr(trace, 'x') and trace.x is not None and len(trace.x) > 0:
+                    has_valid_data = True
                     break
-                if hasattr(t, 'y') and t.y is not None and len(t.y) > 0:
-                    has_valid = True
+                if hasattr(trace, 'y') and trace.y is not None and len(trace.y) > 0:
+                    has_valid_data = True
                     break
-            if has_valid:
+                # Check for values (pie/donut charts)
+                if hasattr(trace, 'values') and trace.values is not None and len(trace.values) > 0:
+                    has_valid_data = True
+                    break
+                # Check for z values (heatmaps)
+                if hasattr(trace, 'z') and trace.z is not None and (len(trace.z) > 0 if not isinstance(trace.z, (int, float)) else True):
+                    has_valid_data = True
+                    break
+            if has_valid_data:
                 return fig
+        
         return None
-    except Exception:
+    except Exception as exc:
+        logger.exception("Chart build failed: %s", getattr(fn, "__name__", fn))
         return None
 
+def render_plotly(fig: Optional[go.Figure]) -> None:
+    if fig is None:
+        st.caption("No data available for this chart yet. Run analysis first.")
+        return
+    try:
+        st.plotly_chart(fig, use_container_width=True, config={"responsive": True, "displayModeBar": False})
+    except Exception as exc:
+        logger.exception("Plotly render failed")
+        st.caption("Error rendering chart. Please try again.")
+
 def show_table(df_slice: pd.DataFrame) -> None:
-    """Render a clean table — safe with empty/None guards."""
-    if df_slice is not None and isinstance(df_slice, pd.DataFrame) and len(df_slice) > 0:
-        st.dataframe(df_slice, use_container_width=True, hide_index=True)
+    """Render a clean table — safe with empty/None guards, removes empty rows."""
+    if df_slice is None or not isinstance(df_slice, pd.DataFrame) or df_slice.empty:
+        st.caption("No data available.")
+        return
+    
+    safe_df = df_slice.copy()
+    # Replace inf with NA
+    safe_df = safe_df.replace([float("inf"), float("-inf")], pd.NA)
+    
+    # Remove rows that are completely empty (all NaN)
+    safe_df = safe_df.dropna(how="all")
+    
+    if safe_df.empty:
+        st.caption("No valid data to display.")
+        return
+    
+    height = min(620, max(240, 38 * (len(safe_df) + 1)))
+    try:
+        st.dataframe(safe_df, use_container_width=True, hide_index=True, height=height)
+    except TypeError:
+        try:
+            st.dataframe(safe_df, use_container_width=True, height=height)
+        except Exception as exc:
+            logger.exception("Table render error")
+            st.caption("Error rendering table.")
+    except Exception as exc:
+        logger.exception("Table render error")
+        st.caption("Error rendering table.")
+
+def category_preview(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "category" not in df.columns:
+        return pd.DataFrame()
+    work = df.copy()
+    if "product_name" not in work.columns:
+        work["product_name"] = work.index.astype(str)
+    for col in ["current_price", "profit_margin", "revenue"]:
+        if col not in work.columns:
+            work[col] = 0.0
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
+    return work.groupby("category", dropna=False).agg(
+        products=("product_name", "count"),
+        avg_price=("current_price", "mean"),
+        avg_margin=("profit_margin", "mean"),
+        revenue=("revenue", "sum"),
+    ).reset_index()
 
 def safe_metric(col, label: str, value: str, delta=None) -> None:
     """Render a metric safely inside a column."""
@@ -698,6 +822,9 @@ def render_sidebar() -> None:
 def require_data(prefer_analyzed: bool = False) -> Optional[pd.DataFrame]:
     df = get_df(prefer_analyzed=prefer_analyzed)
     if df is None: st.info("Upload a CSV/Excel or load the sample dataset from the sidebar.")
+    elif df.empty:
+        st.warning("No data available.")
+        return None
     return df
 
 
@@ -712,25 +839,35 @@ def render_executive_overview() -> None:
     ins = st.session_state.insights or build_insights(df)
     rd = ins.get("expected_revenue", 0) - ins.get("current_revenue", 0)
 
-    # SAFE: Use st.columns directly, not wrapped in raw HTML divs
-    cols = st.columns(5)
+    # KPI Metrics - improved spacing and width for full number display
+    st.markdown("<div style='margin-bottom: 1.5rem;'></div>", unsafe_allow_html=True)
+    cols = st.columns(5, gap="medium")
+    
     safe_metric(cols[0], "Products", f"{ins.get('total_products',0):,}")
     safe_metric(cols[1], "Revenue", fmt_money(ins.get("current_revenue",0)))
     safe_metric(cols[2], "Expected", fmt_money(ins.get("expected_revenue",0)), fmt_money(rd))
     safe_metric(cols[3], "Margin", f"{ins.get('avg_margin',0)*100:.1f}%")
     safe_metric(cols[4], "High Risk", f"{ins.get('high_risk_count',0):,}")
 
+    # Charts section
+    st.markdown("<div style='margin-top: 1.5rem; margin-bottom: 1rem;'></div>", unsafe_allow_html=True)
+    
     l, r = st.columns([1.25, 1])
     with l:
         fig = safe_chart(viz.create_revenue_by_category_chart, df)
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            render_plotly(fig)
         else:
             st.caption("Revenue chart not available yet. Run analysis first.")
     with r:
-        fig = safe_chart(viz.create_recommendation_pie, df) if "recommendation" in df.columns else safe_chart(viz.create_margin_distribution_chart, df)
+        fig = None
+        if "recommendation" in df.columns:
+            fig = safe_chart(viz.create_recommendation_pie, df)
+        if fig is None:
+            margin_col = "profit_margin" if "profit_margin" in df.columns else "margin_percentage"
+            fig = safe_chart(viz.create_margin_distribution_chart, df, margin_col=margin_col)
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            render_plotly(fig)
         else:
             st.caption("Distribution chart not available yet. Run analysis first.")
 
@@ -739,7 +876,7 @@ def render_executive_overview() -> None:
     av = [c for c in pcols if c in df.columns]
     if av:
         sc = "composite_risk_score" if "composite_risk_score" in df.columns else av[0]
-        sorted_df = df.sort_values(sc, ascending=False)[av].head(15)
+        sorted_df = safe_sort(df, sc, ascending=False)[av].head(15)
         show_table(sorted_df)
 
 
@@ -795,7 +932,7 @@ def render_pricing_engine() -> None:
             try:
                 fig = safe_chart(fn, df)
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    render_plotly(fig)
                 else:
                     st.caption("No data available for chart.")
             except Exception:
@@ -803,49 +940,56 @@ def render_pricing_engine() -> None:
     cols = ["product_name","category","current_price","optimal_price","price_change_pct","recommendation","expected_revenue","expected_profit","explanation_summary"]
     available_cols = [c for c in cols if c in df.columns]
     if available_cols:
-        sorted_df = df[available_cols].sort_values("price_change_pct", ascending=False)
+        sorted_df = safe_sort(df[available_cols], "price_change_pct", ascending=False)
         show_table(sorted_df)
 
 
 def render_demand_forecasting() -> None:
     page_hdr("Demand Forecasting", "30-day projections and trend segmentation.")
     df = require_data(prefer_analyzed=True)
-    if df is None or "predicted_demand" not in df.columns: st.warning("Run full analysis first."); return
+    if df is None or "predicted_demand" not in df.columns: 
+        st.warning("Run full analysis first.")
+        return
+    
+    # KPI Metrics
     cols = st.columns(4)
     safe_metric(cols[0], "Avg Demand", f"{numcol(df,'predicted_demand').mean():,.0f}")
     safe_metric(cols[1], "Confidence", f"{numcol(df,'forecast_confidence').mean()*100:.0f}%")
     safe_metric(cols[2], "Total Forecast", f"{numcol(df,'forecast_next_30d').sum():,.0f}")
     inc = int((df.get("demand_trend_category", pd.Series(dtype=str)) == "increasing").sum())
     safe_metric(cols[3], "Increasing", f"{inc:,}")
-    l, r = st.columns(2)
+
+    st.markdown("<div style='margin-top: 1.5rem; margin-bottom: 1rem;'></div>", unsafe_allow_html=True)
+    
+    # Charts section
+    l, r = st.columns(2, gap="medium")
+    
     with l:
-        fcols = [c for c in df.columns if c.startswith("forecast_week_")]
-        if fcols and len(fcols) > 0:
-            wk = df[fcols].sum().reset_index()
-            wk.columns = ["week","units"]
-            try:
-                fig = px.line(wk, x="week", y="units", markers=True, title="Weekly Forecast").update_layout(
-                    margin=dict(l=10,r=10,t=30,b=10), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception:
-                st.caption("Forecast chart unavailable.")
+        st.markdown("<div class='sub-title' style='margin-top: 0; margin-bottom: 0.5rem;'>Weekly Forecast</div>", unsafe_allow_html=True)
+        fig = safe_chart(viz.create_weekly_forecast_chart, df)
+        if fig:
+            render_plotly(fig)
         else:
-            st.info("No forecast data yet.")
+            st.warning("Weekly forecast chart unavailable. Check data for forecast_week columns.")
+    
     with r:
-        if "demand_trend_category" in df.columns:
-            tc = df["demand_trend_category"].value_counts().reset_index()
-            tc.columns = ["trend","count"]
-            try:
-                fig = px.pie(tc, values="count", names="trend", title="Trend Distribution", hole=0.4,
-                    color="trend", color_discrete_map={"increasing":"#2e7d32","stable":"#1565c0","declining":"#c62828"})\
-                    .update_layout(margin=dict(l=10,r=10,t=30,b=10), paper_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception:
-                st.caption("Trend chart unavailable.")
+        st.markdown("<div class='sub-title' style='margin-top: 0; margin-bottom: 0.5rem;'>Trend Distribution</div>", unsafe_allow_html=True)
+        fig = safe_chart(viz.create_trend_distribution_chart, df)
+        if fig:
+            render_plotly(fig)
+        else:
+            st.warning("Trend distribution chart unavailable. Check data for demand_trend_category column.")
+    
+    # Data table
+    st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='sub-title'>Forecast Details</div>", unsafe_allow_html=True)
+    
     cols = ["product_name","category","sales_volume","predicted_demand","forecast_confidence","forecast_ci_lower","forecast_ci_upper","demand_trend_category"]
     available_cols = [c for c in cols if c in df.columns]
     if available_cols:
-        show_table(df[available_cols].sort_values("predicted_demand", ascending=False))
+        show_table(safe_sort(df[available_cols], "predicted_demand", ascending=False))
+    else:
+        st.warning("No forecast columns available.")
 
 
 def render_competitor_intelligence() -> None:
@@ -859,11 +1003,11 @@ def render_competitor_intelligence() -> None:
     safe_metric(cols[3], "Undercuts", f"{int(df.get('competitor_undercut_flag',pd.Series(dtype=bool)).sum()):,}")
     fig = safe_chart(viz.create_competitor_price_comparison, df)
     if fig:
-        st.plotly_chart(fig, use_container_width=True)
+        render_plotly(fig)
     cols = ["product_name","category","current_price","competitor_price","market_position","price_gap_pct","competitive_score","pricing_recommendation"]
     available_cols = [c for c in cols if c in df.columns]
     if available_cols:
-        show_table(df[available_cols].sort_values("competitive_score"))
+        show_table(safe_sort(df[available_cols], "competitive_score"))
 
 
 def render_inventory_optimization() -> None:
@@ -877,11 +1021,11 @@ def render_inventory_optimization() -> None:
     safe_metric(cols[3], "Discount", f"{int((df.get('inventory_action',pd.Series(dtype=str))=='discount').sum()):,}")
     fig = safe_chart(viz.create_stock_status_pie, df)
     if fig:
-        st.plotly_chart(fig, use_container_width=True)
+        render_plotly(fig)
     cols = ["product_name","category","inventory_level","sales_volume","days_of_cover","stock_status","inventory_action","price_adjustment_pct","reorder_point","recommended_order_qty"]
     available_cols = [c for c in cols if c in df.columns]
     if available_cols:
-        show_table(df[available_cols].sort_values("days_of_cover"))
+        show_table(safe_sort(df[available_cols], "days_of_cover"))
 
 
 def render_risk_explainability() -> None:
@@ -922,9 +1066,7 @@ def render_reports() -> None:
         st.warning(f"Excel/PDF unavailable: {REPORTING_IMPORT_ERROR}")
         st.info("Install openpyxl and reportlab.")
         if "category" in df.columns:
-            show_table(df.groupby("category").agg(
-                products=("product_name","count"), avg_price=("current_price","mean"),
-                avg_margin=("profit_margin","mean"), revenue=("revenue","sum")).reset_index())
+            show_table(category_preview(df))
         return
     gen = ReportGenerator(st.session_state.config)
     with c2:
@@ -944,9 +1086,7 @@ def render_reports() -> None:
             with open(st.session_state["re_risk"],"rb") as f: st.download_button("Download Risk", f.read(), Path(st.session_state["re_risk"]).name, use_container_width=True)
     if "category" in df.columns:
         st.subheader("Preview")
-        show_table(df.groupby("category").agg(
-            products=("product_name","count"), avg_price=("current_price","mean"),
-            avg_margin=("profit_margin","mean"), revenue=("revenue","sum")).reset_index())
+        show_table(category_preview(df))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1159,6 +1159,8 @@ def _fallback_batch_forecast(
             (result_df["demand_trend_category"] == trend_cat).sum()
         )
 
+    return result_df, report
+
 # ═══════════════════════════════════════════════════════════════════════════
 # MODEL PERSISTENCE
 # ═══════════════════════════════════════════════════════════════════════════

@@ -168,6 +168,9 @@ def create_kpi_row(
     Returns:
         List of 4 Plotly Figures.
     """
+    if df is None or df.empty:
+        return [_empty_figure(f"No {col} data.") for col in ["Revenue", "Profit", "Margin", "Products"]]
+    
     total_revenue = float(df[revenue_col].sum()) if revenue_col in df.columns else 0
     total_profit = float(df[profit_col].sum()) if profit_col in df.columns else 0
     avg_margin = float(df[margin_col].mean()) if margin_col in df.columns else 0
@@ -228,16 +231,21 @@ def create_revenue_by_category_chart(
     Returns:
         Plotly Figure.
     """
+    if df is None or df.empty:
+        return _empty_figure("No data available.")
+    
     if revenue_col not in df.columns or category_col not in df.columns:
-        return _empty_figure("Revenue or category data not available.")
+        return _empty_figure(f"Missing columns: {revenue_col}, {category_col}")
 
     cat_rev = df.groupby(category_col)[revenue_col].sum().reset_index()
+    
+    # Filter out zero/null values
+    cat_rev = cat_rev[cat_rev[revenue_col] > 0]
+    
+    if cat_rev.empty:
+        return _empty_figure("No revenue data available.")
+    
     cat_rev = cat_rev.sort_values(revenue_col, ascending=True).tail(top_n)
-
-    # Colour gradient
-    colors = px.colors.sequential.Blues_r[
-        :len(cat_rev)
-    ] if len(cat_rev) <= 10 else px.colors.sequential.Blues_r
 
     fig = px.bar(
         cat_rev,
@@ -285,10 +293,17 @@ def create_profit_by_category_chart(
     Returns:
         Plotly Figure.
     """
+    if df is None or df.empty:
+        return _empty_figure("No data available.")
+    
     if profit_col not in df.columns or category_col not in df.columns:
-        return _empty_figure("Profit or category data not available.")
+        return _empty_figure(f"Missing columns: {profit_col}, {category_col}")
 
     cat_profit = df.groupby(category_col)[profit_col].sum().reset_index()
+    
+    if cat_profit.empty:
+        return _empty_figure("No profit data available.")
+    
     cat_profit = cat_profit.sort_values(profit_col, ascending=True).tail(top_n)
 
     # Split positive / negative for colouring
@@ -418,14 +433,23 @@ def create_top_products_chart(
     Returns:
         Plotly Figure.
     """
+    if df is None or df.empty:
+        return _empty_figure("No data available.")
+    
     if value_col not in df.columns or name_col not in df.columns:
         return _empty_figure(f"Column '{value_col}' or '{name_col}' not found.")
 
-    sorted_df = df.sort_values(value_col, ascending=ascending).head(top_n)
+    plot_df = df[[name_col, value_col] + ([category_col] if category_col in df.columns else [])].copy()
+    plot_df = plot_df.dropna(subset=[value_col])
+    
+    if plot_df.empty:
+        return _empty_figure("No valid data available.")
+    
+    sorted_df = plot_df.sort_values(value_col, ascending=ascending).head(top_n)
 
     direction = "Bottom" if ascending else "Top"
     default_title = (
-        f"{direction} {top_n} Products by {value_col.replace('_', ' ').title()}"
+        f"{direction} {min(top_n, len(sorted_df))} Products by {value_col.replace('_', ' ').title()}"
     )
 
     fig = px.bar(
@@ -449,7 +473,7 @@ def create_top_products_chart(
         hovertemplate="<b>%{y}</b><br>%{x:,.2f}<extra></extra>",
     )
     fig.update_layout(
-        height=50 + top_n * 35,
+        height=50 + min(top_n, len(sorted_df)) * 35,
         margin=dict(l=10, r=10, t=40, b=10),
         yaxis={"categoryorder": "total ascending"},
         hovermode="y unified",
@@ -534,7 +558,10 @@ def create_margin_distribution_chart(
     category_col: str = "category",
 ) -> go.Figure:
     """
-    Box plot of margin percentage distribution by category.
+    Donut chart showing average margin contribution by category.
+
+    Derives margin from current_price and cost_price if the margin column
+    doesn't exist. Uses pd.to_numeric for safe conversion.
 
     Args:
         df: DataFrame.
@@ -544,35 +571,80 @@ def create_margin_distribution_chart(
     Returns:
         Plotly Figure.
     """
-    if margin_col not in df.columns:
-        return _empty_figure("Margin data not available.")
+    if df is None or df.empty:
+        return _empty_figure("No data available.")
+    if category_col not in df.columns:
+        return _empty_figure("Category column not found.")
 
-    fig = px.box(
-        df,
-        x=category_col if category_col in df.columns else None,
-        y=margin_col,
+    # Step 1 — Derive margin column if missing
+    work_df = df.copy()
+    if margin_col not in work_df.columns:
+        if "current_price" in work_df.columns and "cost_price" in work_df.columns:
+            work_df[margin_col] = (
+                (pd.to_numeric(work_df["current_price"], errors="coerce")
+                 - pd.to_numeric(work_df["cost_price"], errors="coerce"))
+                / pd.to_numeric(work_df["current_price"], errors="coerce")
+            ).clip(lower=0)
+        elif "profit_margin" in work_df.columns:
+            margin_col = "profit_margin"
+        else:
+            return _empty_figure("Cannot compute margin: need current_price and cost_price columns.")
+
+    # Step 2 — Clean data: ensure numeric, drop NaN
+    work_df[margin_col] = pd.to_numeric(work_df[margin_col], errors="coerce")
+    plot_df = work_df[[category_col, margin_col]].dropna()
+    if plot_df.empty:
+        return _empty_figure("No valid margin data after cleaning.")
+
+    # Step 3 — Build aggregated chart dataframe
+    chart_df = (
+        plot_df.groupby(category_col)[margin_col]
+        .mean()
+        .reset_index()
+    )
+    if chart_df.empty:
+        return _empty_figure("No aggregated data available.")
+
+    chart_df.columns = ["category", "margin"]
+
+    # Step 4 — Render pie/donut chart
+    color_palette = px.colors.qualitative.Set2
+
+    fig = px.pie(
+        chart_df,
+        names="category",
+        values="margin",
         title="Margin Distribution by Category",
-        labels={margin_col: "Margin (%)", category_col: ""},
-        color=category_col if category_col in df.columns else None,
-        color_discrete_sequence=COLOR_PALETTE,
-        points="outliers",
-        notched=True,
+        color="category",
+        color_discrete_sequence=color_palette,
+        hole=0.45,
     )
 
-    fig.add_hline(
-        y=float(df[margin_col].median()),
-        line_dash="dash",
-        line_color="grey",
-        annotation_text=f"Median: {df[margin_col].median():.1f}%",
+    fig.update_traces(
+        textposition="inside",
+        textinfo="percent+label",
+        hovertemplate="<b>%{label}</b><br>Avg Margin: %{value:.1f}%<br>%{percent}<extra></extra>",
     )
 
     fig.update_layout(
+        title=dict(
+            text="Margin Distribution by Category",
+            font=dict(size=15, color="#1E293B"),
+            x=0.5,
+            xanchor="center",
+        ),
         height=400,
-        margin=dict(l=10, r=10, t=40, b=10),
-        hovermode="x unified",
-        showlegend=False,
+        margin=dict(l=10, r=10, t=50, b=10),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.2,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=12, color="#475569"),
+        ),
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#475569"),
     )
     return fig
 
@@ -724,10 +796,17 @@ def create_recommendation_pie(
     Returns:
         Plotly Figure.
     """
+    if df is None or df.empty:
+        return _empty_figure("No data available.")
+    
     if recommendation_col not in df.columns:
         return _empty_figure("Recommendation data not available.")
 
     rec_counts = df[recommendation_col].value_counts().reset_index()
+    
+    if rec_counts.empty:
+        return _empty_figure("No recommendation data found.")
+    
     rec_counts.columns = ["recommendation", "count"]
 
     # Order
@@ -1328,6 +1407,144 @@ def create_demand_forecast_line(
     return fig
 
 
+def create_weekly_forecast_chart(
+    df: pd.DataFrame,
+    forecast_cols: Optional[List[str]] = None,
+) -> go.Figure:
+    """
+    Line chart aggregating weekly forecast totals.
+
+    Sums all products' forecast for each week.
+
+    Args:
+        df: DataFrame with forecast_week_1..4 columns.
+        forecast_cols: List of forecast week columns.
+
+    Returns:
+        Plotly Figure.
+    """
+    if df is None or df.empty:
+        return _empty_figure("No data available.")
+
+    if forecast_cols is None:
+        forecast_cols = [
+            "forecast_week_1",
+            "forecast_week_2",
+            "forecast_week_3",
+            "forecast_week_4",
+        ]
+
+    available = [c for c in forecast_cols if c in df.columns]
+    if not available:
+        return _empty_figure("No forecast week columns found.")
+
+    # Validate data
+    plot_df = df[available].copy()
+    for col in available:
+        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce").fillna(0)
+
+    # Sum by week
+    weekly_totals = plot_df.sum()
+
+    if weekly_totals.sum() <= 0:
+        return _empty_figure("No forecast data available.")
+
+    # Prepare data for chart
+    chart_data = pd.DataFrame({
+        "week": [f"Week {i+1}" for i in range(len(available))],
+        "units": weekly_totals.values,
+    })
+
+    fig = px.line(
+        chart_data,
+        x="week",
+        y="units",
+        markers=True,
+        title="Weekly Forecast Totals",
+        labels={"units": "Forecasted Units", "week": "Week"},
+    )
+
+    fig.update_traces(
+        line=dict(width=3, color=COLORS["primary"]),
+        marker=dict(size=8, color=COLORS["primary"]),
+        hovertemplate="<b>%{x}</b><br>Units: %{y:,.0f}<extra></extra>",
+    )
+
+    fig.update_layout(
+        height=400,
+        margin=dict(l=10, r=10, t=40, b=10),
+        hovermode="x unified",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        yaxis_title="Forecasted Units",
+    )
+    return fig
+
+
+def create_trend_distribution_chart(
+    df: pd.DataFrame,
+    trend_col: str = "demand_trend_category",
+) -> go.Figure:
+    """
+    Donut chart showing distribution of demand trend categories.
+
+    Args:
+        df: DataFrame with demand trend data.
+        trend_col: Trend category column name.
+
+    Returns:
+        Plotly Figure.
+    """
+    if df is None or df.empty:
+        return _empty_figure("No data available.")
+
+    if trend_col not in df.columns:
+        return _empty_figure(f"Trend column '{trend_col}' not found.")
+
+    # Get trend value counts
+    trend_counts = df[trend_col].value_counts().reset_index()
+
+    if trend_counts.empty:
+        return _empty_figure("No trend data available.")
+
+    trend_counts.columns = ["trend", "count"]
+
+    # Define trend colors
+    trend_colors = {
+        "increasing": "#2e7d32",
+        "stable": "#1565c0",
+        "declining": "#c62828",
+        "Increasing": "#2e7d32",
+        "Stable": "#1565c0",
+        "Declining": "#c62828",
+    }
+
+    # Map colors to trends (case-insensitive)
+    colors = [trend_colors.get(str(t), COLORS["grey"]) for t in trend_counts["trend"]]
+
+    fig = px.pie(
+        trend_counts,
+        values="count",
+        names="trend",
+        title="Demand Trend Distribution",
+        hole=0.4,
+    )
+
+    fig.update_traces(
+        marker=dict(colors=colors),
+        textposition="inside",
+        textinfo="percent+label",
+        hovertemplate="<b>%{label}</b><br>Count: %{value}<br>%{percent}<extra></extra>",
+    )
+
+    fig.update_layout(
+        height=400,
+        margin=dict(l=10, r=10, t=40, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
 def create_elasticity_scatter(
     df: pd.DataFrame,
     elasticity_col: str = "price_elasticity",
@@ -1573,3 +1790,51 @@ def _empty_figure(message: str = "No data available.") -> go.Figure:
         yaxis=dict(visible=False),
     )
     return fig
+
+
+def _normalise_chart_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce common chart fields without changing analytical calculations."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    numeric_like = [
+        "current_price", "cost_price", "competitor_price", "market_min", "market_max",
+        "sales_volume", "inventory_level", "revenue", "expected_revenue",
+        "expected_profit", "profit_margin", "margin_percentage", "expected_margin",
+        "price_change_pct", "composite_risk_score", "risk_score",
+        "margin_risk_score", "demand_risk_score", "inventory_risk_score",
+        "competitor_risk_score", "competitive_risk_score", "competitive_score",
+        "price_gap_pct", "days_of_cover", "inventory_turnover", "demand_score",
+        "demand_trend", "predicted_demand", "forecast_next_30d",
+        "forecast_confidence",
+    ]
+    numeric_like.extend([c for c in out.columns if c.startswith("forecast_week_")])
+    for col in numeric_like:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    for col in ["category", "product_name", "recommendation", "risk_level", "risk_category", "stock_status", "inventory_health", "demand_category", "demand_trend_category", "market_position"]:
+        if col in out.columns:
+            out[col] = out[col].fillna("Unknown").astype(str)
+    return out.replace([float("inf"), float("-inf")], pd.NA)
+
+
+def _make_chart_safe(fn):
+    def wrapper(df=None, *args, **kwargs):
+        try:
+            if isinstance(df, pd.DataFrame):
+                safe_df = _normalise_chart_df(df)
+                if safe_df.empty:
+                    return _empty_figure("No data available.")
+                return fn(safe_df, *args, **kwargs)
+            return fn(df, *args, **kwargs)
+        except Exception as exc:
+            logger.exception("Chart factory failed: %s", getattr(fn, "__name__", fn))
+            return _empty_figure(f"Chart unavailable: {exc}")
+    wrapper.__name__ = getattr(fn, "__name__", "chart_wrapper")
+    wrapper.__doc__ = getattr(fn, "__doc__", None)
+    return wrapper
+
+
+for _name, _fn in list(globals().items()):
+    if _name.startswith("create_") and callable(_fn) and _name != "create_kpi_card":
+        globals()[_name] = _make_chart_safe(_fn)

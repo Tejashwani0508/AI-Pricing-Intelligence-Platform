@@ -338,6 +338,47 @@ def _subsection(title: str) -> str:
     return f"\n**{title}**\n"
 
 
+def _normalise_assistant_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Prepare analysis outputs for safe read-only chatbot access."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    numeric_cols = [
+        "current_price", "cost_price", "competitor_price", "sales_volume",
+        "inventory_level", "revenue", "expected_revenue", "expected_profit",
+        "profit_margin", "margin_percentage", "price_change_pct",
+        "composite_risk_score", "competitive_score", "price_gap_pct",
+        "days_of_cover", "predicted_demand", "forecast_next_30d",
+        "forecast_confidence", "demand_trend",
+    ]
+    numeric_cols.extend([c for c in out.columns if c.startswith("forecast_week_")])
+    for col in numeric_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+    for col in ["product_name", "category", "recommendation", "risk_level", "stock_status", "inventory_action", "market_position", "demand_trend_category"]:
+        if col in out.columns:
+            out[col] = out[col].fillna("Unknown").astype(str)
+    return out.replace([np.inf, -np.inf], 0)
+
+
+def _clean_response_start(text: str) -> str:
+    """Keep responses readable in Streamlit and Windows consoles."""
+    if not text:
+        return ""
+    cleaned = text.strip()
+    while cleaned and not cleaned[0].isascii():
+        cleaned = cleaned[1:].lstrip()
+    while cleaned and cleaned[0] in "#* _-:|>":
+        cleaned = cleaned[1:].lstrip()
+        while cleaned and not cleaned[0].isascii():
+            cleaned = cleaned[1:].lstrip()
+    lines = cleaned.splitlines()
+    if lines:
+        lines[0] = lines[0].replace("*", "").strip()
+        cleaned = "\n".join(lines)
+    return cleaned[:1].upper() + cleaned[1:] if cleaned else ""
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CONTEXT BUILDERS  (extract business summaries from DataFrame)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -556,37 +597,48 @@ def _fallback_response(query: str, df: pd.DataFrame,
     2. Route to appropriate intent handler
     3. Fallback to generic help if intent unclear
     """
+    safe_df = _normalise_assistant_df(df)
+    if safe_df.empty:
+        return "No data is available yet. Please load a dataset and run the analysis pipeline first."
+
     query_lower = query.lower()
     intent_name, confidence = IntentClassifier.classify(query_lower)
 
-    if intent_name == "GREETING":
-        return _handle_greeting(query)
-    elif intent_name == "PRICING_INCREASE":
-        return _handle_pricing_increase(df)
-    elif intent_name == "PRICING_DECREASE":
-        return _handle_pricing_decrease(df)
-    elif intent_name == "PRICING":
-        return _handle_pricing(df)
-    elif intent_name == "MARGINS":
-        return _handle_margins(df)
-    elif intent_name == "RISK":
-        return _handle_risk(df)
-    elif intent_name == "INVENTORY":
-        return _handle_inventory(df)
-    elif intent_name == "FORECASTING":
-        return _handle_forecasting(df)
-    elif intent_name == "COMPETITORS":
-        return _handle_competitors(df)
-    elif intent_name == "PORTFOLIO":
-        return _handle_portfolio(df, insights)
-    elif intent_name == "ALERTS":
-        return _handle_alerts(alerts)
-    elif intent_name == "TOP_PRODUCTS":
-        return _handle_top_products(df)
-    elif intent_name == "HELP":
-        return _handle_help()
-    else:
-        return _handle_generic_fallback()
+    try:
+        if intent_name == "GREETING":
+            return _handle_greeting(query)
+        elif intent_name == "PRICING_INCREASE":
+            return _handle_pricing_increase(safe_df)
+        elif intent_name == "PRICING_DECREASE":
+            return _handle_pricing_decrease(safe_df)
+        elif intent_name == "PRICING":
+            return _handle_pricing(safe_df)
+        elif intent_name == "MARGINS":
+            return _handle_margins(safe_df)
+        elif intent_name == "RISK":
+            return _handle_risk(safe_df)
+        elif intent_name == "INVENTORY":
+            return _handle_inventory(safe_df)
+        elif intent_name == "FORECASTING":
+            return _handle_forecasting(safe_df)
+        elif intent_name == "COMPETITORS":
+            return _handle_competitors(safe_df)
+        elif intent_name == "PORTFOLIO":
+            return _handle_portfolio(safe_df, insights)
+        elif intent_name == "ALERTS":
+            return _handle_alerts(alerts)
+        elif intent_name == "TOP_PRODUCTS":
+            return _handle_top_products(safe_df)
+        elif intent_name == "HELP":
+            return _handle_help()
+        else:
+            return _handle_portfolio(safe_df, insights)
+    except Exception as exc:
+        logger.exception("Rule-based assistant response failed")
+        return (
+            "I found the analysis context, but that specific view could not be rendered safely. "
+            f"Try a pricing, risk, margin, inventory, forecast, competitor, or portfolio question. Details: {exc}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1260,15 +1312,16 @@ class AIAssistant:
             insights: Summary insights dictionary.
             alerts: Optional list of generated alerts.
         """
-        self._df = df
-        self._insights = insights
+        safe_df = _normalise_assistant_df(df)
+        self._df = safe_df
+        self._insights = insights or {}
         self._alerts = alerts or []
-        self._system_context = _build_system_context(df, insights, self._alerts)
+        self._system_context = _build_system_context(safe_df, self._insights, self._alerts) if not safe_df.empty else ""
         self._context_built = True
         self._last_context_refresh = datetime.now()
 
         logger.info(
-            f"Context loaded: {len(df)} products, "
+            f"Context loaded: {len(safe_df)} products, "
             f"{len(self._alerts)} alerts"
         )
 
@@ -1334,6 +1387,7 @@ class AIAssistant:
         # Fallback to rules
         if response is None:
             response = _fallback_response(query_stripped, self._df, self._insights, self._alerts)
+        response = _clean_response_start(response)
 
         # Add to history
         self._history.append(ChatMessage(
