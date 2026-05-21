@@ -837,17 +837,15 @@ def render_executive_overview() -> None:
     df = require_data(prefer_analyzed=True)
     if df is None: return
     ins = st.session_state.insights or build_insights(df)
-    rd = ins.get("expected_revenue", 0) - ins.get("current_revenue", 0)
 
     # KPI Metrics - improved spacing and width for full number display
     st.markdown("<div style='margin-bottom: 1.5rem;'></div>", unsafe_allow_html=True)
-    cols = st.columns(5, gap="medium")
+    cols = st.columns(4, gap="medium")
     
     safe_metric(cols[0], "Products", f"{ins.get('total_products',0):,}")
-    safe_metric(cols[1], "Revenue", fmt_money(ins.get("current_revenue",0)))
-    safe_metric(cols[2], "Expected", fmt_money(ins.get("expected_revenue",0)), fmt_money(rd))
-    safe_metric(cols[3], "Margin", f"{ins.get('avg_margin',0)*100:.1f}%")
-    safe_metric(cols[4], "High Risk", f"{ins.get('high_risk_count',0):,}")
+    safe_metric(cols[1], "Projected Revenue", fmt_money(ins.get("expected_revenue",0)))
+    safe_metric(cols[2], "Margin", f"{ins.get('avg_margin',0)*100:.1f}%")
+    safe_metric(cols[3], "High Risk", f"{ins.get('high_risk_count',0):,}")
 
     # Charts section
     st.markdown("<div style='margin-top: 1.5rem; margin-bottom: 1rem;'></div>", unsafe_allow_html=True)
@@ -1037,18 +1035,207 @@ def render_risk_explainability() -> None:
     safe_metric(cols[1], "Critical", f"{int((df['risk_level']=='CRITICAL').sum()) if 'risk_level' in df.columns else 0:,}")
     safe_metric(cols[2], "High", f"{int((df['risk_level']=='HIGH').sum()) if 'risk_level' in df.columns else 0:,}")
     safe_metric(cols[3], "Explained", f"{int(df.get('explanation_text',pd.Series(dtype=str)).notna().sum()):,}")
-    st.markdown("<div class='sub-title'>Product Explanation</div>", unsafe_allow_html=True)
+
+    # Product selector
+    st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
     labels = df["product_name"].astype(str).tolist() if "product_name" in df.columns else [str(i) for i in df.index]
-    sel = st.selectbox("Select product", labels)
+    sel = st.selectbox("Select a product to analyse", labels)
     row = df[df["product_name"].astype(str) == sel].iloc[0] if "product_name" in df.columns else df.iloc[labels.index(sel)]
-    kc = st.columns(4)
-    kc[0].metric("Price", fmt_money(row.get("current_price",0)))
-    kc[1].metric("Optimal", fmt_money(row.get("optimal_price",row.get("current_price",0))))
-    kc[2].metric("Risk", f"{row.get('composite_risk_score',0):.1f}")
-    kc[3].metric("Recommendation", str(row.get("recommendation","N/A")))
-    st.info(str(row.get("explanation_summary","No explanation.")))
-    with st.expander("Full explanation", expanded=True):
-        st.write(str(row.get("explanation_text",row.get("risk_reason",""))))
+
+    # ─── Product Summary Card ──────────────────────────────────────────
+    pid = str(row.get("product_id", ""))
+    pname = str(row.get("product_name", ""))
+    curr_price = float(row.get("current_price", 0))
+    opt_price = float(row.get("optimal_price", curr_price))
+    price_chg = float(row.get("price_change_pct", 0))
+    rec = str(row.get("recommendation", "N/A"))
+    risk_score = float(row.get("composite_risk_score", 0))
+    risk_lvl = str(row.get("risk_level", "N/A"))
+    margin_val = float(row.get("profit_margin", 0)) * 100
+
+    # Recommendation badge colour
+    rec_color = "#10B981" if rec.lower() == "increase" else "#EF4444" if rec.lower() == "decrease" else "#3B82F6"
+    risk_color = "#EF4444" if risk_lvl in ("HIGH", "CRITICAL") else "#F59E0B" if risk_lvl == "MEDIUM" else "#10B981"
+
+    st.markdown(f"""
+    <div style="background:#FFFFFF; border:1px solid #E5E7EB; border-radius:14px; padding:1.25rem 1.5rem; box-shadow:0 2px 8px rgba(0,0,0,0.04); margin-bottom:1rem;">
+        <h3 style="margin:0 0 0.25rem 0; font-size:1.15rem; font-weight:700; color:#0F172A;">{pname}</h3>
+        <div style="font-size:0.82rem; color:#64748B; margin-bottom:1rem;">Product ID: {pid} | Category: {str(row.get("category", "—"))}</div>
+        <div style="display:flex; gap:1.5rem; flex-wrap:wrap;">
+            <div><span style="font-size:0.72rem; color:#94A3B8; text-transform:uppercase; letter-spacing:0.06em;">Current Price</span><br><span style="font-size:1.25rem; font-weight:800; color:#0F172A;">${curr_price:,.2f}</span></div>
+            <div><span style="font-size:0.72rem; color:#94A3B8; text-transform:uppercase; letter-spacing:0.06em;">Recommended Price</span><br><span style="font-size:1.25rem; font-weight:800; color:#0F172A;">${opt_price:,.2f}</span></div>
+            <div><span style="font-size:0.72rem; color:#94A3B8; text-transform:uppercase; letter-spacing:0.06em;">Price Change</span><br><span style="font-size:1.25rem; font-weight:800; color:{'#EF4444' if price_chg < 0 else '#10B981'};">{price_chg:+.1f}%</span></div>
+            <div><span style="font-size:0.72rem; color:#94A3B8; text-transform:uppercase; letter-spacing:0.06em;">Recommendation</span><br><span style="display:inline-block; margin-top:2px; padding:2px 10px; border-radius:999px; font-size:0.78rem; font-weight:700; color:#FFFFFF; background:{rec_color};">{rec}</span></div>
+            <div><span style="font-size:0.72rem; color:#94A3B8; text-transform:uppercase; letter-spacing:0.06em;">Risk Score</span><br><span style="display:inline-block; margin-top:2px; padding:2px 10px; border-radius:999px; font-size:0.78rem; font-weight:700; color:#FFFFFF; background:{risk_color};">{risk_score:.1f} / 100</span></div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ─── Why This Recommendation? ──────────────────────────────────────
+    st.markdown("<h4 style='font-size:1rem; font-weight:700; color:#0F172A; margin:0.5rem 0 0.75rem;'>Why this recommendation?</h4>", unsafe_allow_html=True)
+
+    raw_bullets = str(row.get("explanation_bullets", "")).split("; ")
+    explanation_text_raw = str(row.get("explanation_text", ""))
+
+    # Build structured business bullet points from explanation data
+    direction_map = {}
+    for fname in ["demand", "inventory", "competitor", "margin", "cost"]:
+        col_name = f"explanation_{fname}_direction"
+        if col_name in row:
+            direction_map[fname] = str(row[col_name])
+        else:
+            direction_map[fname] = "neutral"
+
+    # Demand bullet
+    demand_notes = {
+        "upward": ("Strong customer demand detected.", "Demand levels are high, meaning the product remains competitive even after pricing adjustment."),
+        "slight_upward": ("Moderate customer demand.", "Demand signals are positive, supporting current pricing strategy."),
+        "downward": ("Weakening customer demand.", "Demand levels are declining, warranting a cautious pricing approach."),
+        "slight_downward": ("Slightly softening demand.", "Demand trends show minor softening — monitor closely."),
+        "neutral": ("Stable customer demand.", "Demand levels are consistent with market expectations."),
+    }
+
+    # Inventory bullet
+    inventory_notes = {
+        "upward": ("Low inventory levels detected.", "Limited stock creates scarcity value, supporting price adjustments."),
+        "slight_upward": ("Adequate inventory coverage.", "Stock levels are balanced with current sales velocity."),
+        "downward": ("Excess inventory accumulated.", "High stock levels relative to sales suggest promotional action may be needed."),
+        "slight_downward": ("Slightly elevated inventory.", "Inventory is marginally above target — monitor turnover rates."),
+        "neutral": ("Healthy inventory position.", "Stock levels are well-balanced with demand patterns."),
+    }
+
+    # Competitor bullet
+    competitor_notes = {
+        "upward": ("Competitive pricing advantage.", "Our price compares favourably to competitors, providing market positioning strength."),
+        "slight_upward": ("Slight competitive advantage.", "Minor pricing gaps exist versus competitors — maintain current strategy."),
+        "downward": ("Competitive pressure detected.", "Competitors are pricing lower, creating pressure to adjust our position."),
+        "slight_downward": ("Minor competitive pressure.", "Small competitor price gaps exist — review if trends continue."),
+        "neutral": ("Competitive position is stable.", "Our pricing is aligned with competitor benchmarks."),
+    }
+
+    # Margin bullet
+    margin_notes = {
+        "upward": ("Healthy profit margin available.", f"Current margin is strong ({margin_val:.1f}%), allowing safe pricing flexibility."),
+        "slight_upward": ("Adequate profit margin.", f"Margin at {margin_val:.1f}% supports current pricing decisions."),
+        "downward": ("Margin improvement needed.", f"Current margin of {margin_val:.1f}% is below target — consider cost or price adjustments."),
+        "slight_downward": ("Margin requires attention.", f"Margin of {margin_val:.1f}% needs monitoring to prevent erosion."),
+        "neutral": ("Profit margin is stable.", f"Margin at {margin_val:.1f}% is within acceptable range."),
+    }
+
+    # Cost bullet
+    cost_notes = {
+        "upward": ("Cost pressure identified.", "Rising costs relative to price require management attention to protect margins."),
+        "slight_upward": ("Moderate cost structure.", "Cost ratio is within monitoring range — no immediate action needed."),
+        "downward": ("Cost advantage present.", "Favourable cost structure provides competitive flexibility."),
+        "slight_downward": ("Slight cost advantage.", "Cost position is marginally favourable."),
+        "neutral": ("Cost structure is healthy.", "Costs are well-controlled relative to pricing."),
+    }
+
+    note_map = {
+        "demand": demand_notes,
+        "inventory": inventory_notes,
+        "competitor": competitor_notes,
+        "margin": margin_notes,
+        "cost": cost_notes,
+    }
+
+    # Determine which factors to show
+    factor_labels = {
+        "demand": "Demand",
+        "inventory": "Inventory",
+        "competitor": "Competitor",
+        "margin": "Margin",
+        "cost": "Cost",
+    }
+
+    shown_any = False
+    for fname in ["demand", "inventory", "competitor", "margin", "cost"]:
+        direction = direction_map.get(fname, "neutral")
+        notes = note_map.get(fname, {}).get(direction, None)
+        if notes:
+            shown_any = True
+            title, detail = notes
+            icon_map = {"upward": "▲", "slight_upward": "↗", "downward": "▼", "slight_downward": "↘", "neutral": "●"}
+            icon = icon_map.get(direction, "●")
+            st.markdown(f"""
+            <div style="background:#FAFBFC; border-left:3px solid #3B82F6; border-radius:6px; padding:0.6rem 1rem; margin-bottom:0.5rem;">
+                <div style="font-size:0.85rem; font-weight:700; color:#0F172A;">{icon} <span style="color:#3B82F6;">{factor_labels[fname]}:</span> {title}</div>
+                <div style="font-size:0.8rem; color:#64748B; margin-top:2px;">{detail}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    if not shown_any:
+        st.markdown("""
+        <div style="background:#FAFBFC; border-left:3px solid #94A3B8; border-radius:6px; padding:0.6rem 1rem; margin-bottom:0.5rem;">
+            <div style="font-size:0.85rem; font-weight:600; color:#0F172A;">All factors are balanced.</div>
+            <div style="font-size:0.8rem; color:#64748B; margin-top:2px;">No significant drivers identified — current pricing is well-positioned.</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ─── Key Drivers Summary ───────────────────────────────────────────
+    st.markdown("<div style='margin-top:1rem;'></div>", unsafe_allow_html=True)
+    st.markdown("<h4 style='font-size:1rem; font-weight:700; color:#0F172A; margin:0 0 0.75rem;'>Key Drivers</h4>", unsafe_allow_html=True)
+
+    # Determine driver quality labels
+    def driver_label(direction: str, factor_name: str) -> tuple:
+        if direction in ("upward",):
+            return ("Strong", "#10B981") if factor_name in ("demand", "margin") else ("Elevated", "#F59E0B")
+        elif direction in ("slight_upward",):
+            return ("Positive", "#10B981") if factor_name in ("demand",) else ("Moderate", "#3B82F6")
+        elif direction in ("downward",):
+            return ("Weak", "#EF4444") if factor_name in ("demand",) else ("Concerning", "#EF4444")
+        elif direction in ("slight_downward",):
+            return ("Softening", "#F59E0B")
+        else:
+            return ("Stable", "#3B82F6")
+
+    kd1, kd2, kd3, kd4 = st.columns(4)
+    for col, fname, label in [
+        (kd1, "demand", "Demand Strength"),
+        (kd2, "margin", "Margin Health"),
+        (kd3, "competitor", "Competitive Position"),
+        (kd4, "risk", "Risk Level"),
+    ]:
+        if col is None:
+            continue
+        if fname == "risk":
+            lbl, clr = ("Low", "#10B981") if risk_score < 30 else ("Moderate", "#F59E0B") if risk_score < 50 else ("High", "#EF4444")
+        else:
+            direction = direction_map.get(fname, "neutral")
+            lbl, clr = driver_label(direction, fname)
+        col.markdown(f"""
+        <div style="background:#FFFFFF; border:1px solid #E5E7EB; border-radius:10px; padding:0.6rem 0.8rem; text-align:center; box-shadow:0 1px 4px rgba(0,0,0,0.03);">
+            <div style="font-size:0.65rem; color:#94A3B8; text-transform:uppercase; letter-spacing:0.06em; font-weight:700; margin-bottom:4px;">{label}</div>
+            <div style="display:inline-block; padding:1px 10px; border-radius:999px; font-size:0.75rem; font-weight:700; color:#FFFFFF; background:{clr};">{lbl}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ─── Technical Details (collapsible) ───────────────────────────────
+    st.markdown("<div style='margin-top:1rem;'></div>", unsafe_allow_html=True)
+    with st.expander("Technical Details", expanded=False):
+        st.markdown("""
+        <div style="font-size:0.82rem; color:#64748B; margin-bottom:0.5rem;">
+        Raw model factors and contribution estimates for analyst review.
+        </div>
+        """, unsafe_allow_html=True)
+        # Extract raw factors from explanation_summary if possible
+        raw_factors = {}
+        for fname in ["demand", "inventory", "competitor", "margin", "cost"]:
+            col_name = f"explanation_{fname}_direction"
+            if col_name in row:
+                raw_factors[f"{fname}_direction"] = str(row[col_name])
+        # Add other raw fields
+        for col in ["demand_trend", "price_elasticity", "sales_volume", "inventory_level", "competitor_price", "cost_price", "profit_margin"]:
+            if col in row:
+                try:
+                    raw_factors[col] = float(row[col])
+                except (ValueError, TypeError):
+                    raw_factors[col] = str(row[col])
+        st.json(raw_factors)
+
+        if explanation_text_raw and len(explanation_text_raw) > 5:
+            st.markdown("**Full Explanation Text:**")
+            st.code(explanation_text_raw, language="text")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1056,34 +1243,24 @@ def render_risk_explainability() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def render_reports() -> None:
-    page_hdr("Reports", "Generate CSV, Excel, PDF, and focused risk reports.")
+    page_hdr("Reports", "Generate CSV and PDF reports.")
     df = require_data(prefer_analyzed=True)
     if df is None: return
     ins = st.session_state.insights or build_insights(df)
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2 = st.columns(2)
     c1.download_button("Download CSV", data=df_to_csv(df), file_name="pricing_analysis.csv", mime="text/csv", use_container_width=True)
     if not REPORTING_AVAILABLE:
-        st.warning(f"Excel/PDF unavailable: {REPORTING_IMPORT_ERROR}")
+        st.warning(f"PDF unavailable: {REPORTING_IMPORT_ERROR}")
         st.info("Install openpyxl and reportlab.")
         if "category" in df.columns:
             show_table(category_preview(df))
         return
     gen = ReportGenerator(st.session_state.config)
     with c2:
-        if st.button("Generate Excel", use_container_width=True):
-            with st.spinner("Generating..."): st.session_state["re_xlsx"] = gen.generate_excel_report(df, ins)
-        if "re_xlsx" in st.session_state:
-            with open(st.session_state["re_xlsx"],"rb") as f: st.download_button("Download Excel", f.read(), Path(st.session_state["re_xlsx"]).name, use_container_width=True)
-    with c3:
         if st.button("Generate PDF", use_container_width=True):
             with st.spinner("Generating..."): st.session_state["re_pdf"] = gen.generate_pdf_report(df, ins)
         if "re_pdf" in st.session_state:
             with open(st.session_state["re_pdf"],"rb") as f: st.download_button("Download PDF", f.read(), Path(st.session_state["re_pdf"]).name, mime="application/pdf", use_container_width=True)
-    with c4:
-        if st.button("Risk Report", use_container_width=True):
-            with st.spinner("Generating..."): st.session_state["re_risk"] = gen.generate_risk_report(df)
-        if "re_risk" in st.session_state:
-            with open(st.session_state["re_risk"],"rb") as f: st.download_button("Download Risk", f.read(), Path(st.session_state["re_risk"]).name, use_container_width=True)
     if "category" in df.columns:
         st.subheader("Preview")
         show_table(category_preview(df))
