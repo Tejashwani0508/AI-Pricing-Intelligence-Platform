@@ -83,6 +83,58 @@ warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SAFE CALCULATION HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _safe_revenue_share(amount: float, total: float) -> Optional[float]:
+    """Calculate revenue share safely, returning None if invalid (division by zero, etc)."""
+    if total is None or total == 0 or amount is None:
+        return None
+    try:
+        share = (float(amount) / float(total)) * 100
+        if share < -1 or share > 1000:
+            return None
+        return share
+    except (ZeroDivisionError, TypeError, ValueError):
+        return None
+
+
+def _safe_pct(value: Optional[float], decimals: int = 1) -> str:
+    """Format percentage safely, returning 'Revenue unavailable' if value is None or invalid."""
+    if value is None:
+        return "Revenue unavailable"
+    try:
+        return f"{value:.{decimals}f}%"
+    except (TypeError, ValueError):
+        return "Revenue unavailable"
+
+
+def _safe_format_currency(value) -> str:
+    """Format currency safely. Returns '—' if value is None or invalid."""
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+        return f"${v:,.0f}"
+    except (TypeError, ValueError, OverflowError):
+        return "—"
+
+
+def _validate_metric(value, default=None):
+    """Validate a metric value, returning default if it's NaN, None, inf, or absurd."""
+    if value is None:
+        return default
+    try:
+        v = float(value)
+        import math
+        if math.isnan(v) or math.isinf(v) or abs(v) > 1e15:
+            return default
+        return v
+    except (TypeError, ValueError):
+        return default
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTS & STYLES
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -827,7 +879,7 @@ def generate_excel_report(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PDF REPORT — IMPROVED EXECUTIVE-LEVEL BUSINESS REPORT
+# PDF REPORT — EXECUTIVE-LEVEL BUSINESS REPORT
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _get_pdf_styles() -> Dict[str, ParagraphStyle]:
@@ -1006,11 +1058,13 @@ def _compute_insights(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Compute a standard set of KPI insights from a DataFrame.
 
+    Validates all values to prevent NaN, inf, division by zero, or absurd percentages.
+
     Args:
         df: Analysis DataFrame.
 
     Returns:
-        Dict of KPI metrics.
+        Dict of KPI metrics (validated).
     """
     insights: Dict[str, Any] = {}
 
@@ -1018,38 +1072,37 @@ def _compute_insights(df: pd.DataFrame) -> Dict[str, Any]:
     insights["total_products"] = len(df)
     insights["total_categories"] = int(df["category"].nunique()) if "category" in df.columns else 0
 
-    # Revenue
+    # Revenue — safely compute
+    total_revenue = 0
     for col in ["expected_revenue", "revenue"]:
         if col in df.columns:
-            insights["total_revenue"] = round(float(df[col].sum()), 2)
+            total_revenue = _validate_metric(float(df[col].sum()), 0)
             break
-    if "total_revenue" not in insights:
-        if "current_price" in df.columns and "sales_volume" in df.columns:
-            insights["total_revenue"] = round(float((df["current_price"] * df["sales_volume"]).sum()), 2)
-        else:
-            insights["total_revenue"] = 0
+    if total_revenue == 0 and "current_price" in df.columns and "sales_volume" in df.columns:
+        total_revenue = _validate_metric(float((df["current_price"] * df["sales_volume"]).sum()), 0)
+    insights["total_revenue"] = round(total_revenue, 2)
 
     # Current revenue (for delta calculations)
     if "current_price" in df.columns and "sales_volume" in df.columns:
-        insights["current_revenue"] = round(float((df["current_price"] * df["sales_volume"]).sum()), 2)
+        insights["current_revenue"] = _validate_metric(float((df["current_price"] * df["sales_volume"]).sum()), 0)
     else:
         insights["current_revenue"] = insights["total_revenue"]
 
     # Profit
+    total_profit = 0
     for col in ["expected_profit"]:
         if col in df.columns:
-            insights["total_profit"] = round(float(df[col].sum()), 2)
+            total_profit = _validate_metric(float(df[col].sum()), 0)
             break
-    if "total_profit" not in insights:
-        insights["total_profit"] = 0
+    insights["total_profit"] = round(total_profit, 2)
 
     # Margin
     for col in ["margin_percentage", "profit_margin"]:
         if col in df.columns:
             if col == "profit_margin":
-                insights["avg_margin"] = round(float(df[col].mean() * 100), 2)
+                insights["avg_margin"] = _validate_metric(float(df[col].mean() * 100), 0)
             else:
-                insights["avg_margin"] = round(float(df[col].mean()), 2)
+                insights["avg_margin"] = _validate_metric(float(df[col].mean()), 0)
             break
     if "avg_margin" not in insights:
         insights["avg_margin"] = 0
@@ -1057,7 +1110,7 @@ def _compute_insights(df: pd.DataFrame) -> Dict[str, Any]:
     # Risk
     risk_col = "composite_risk_score"
     if risk_col in df.columns:
-        insights["avg_risk"] = round(float(df[risk_col].mean()), 1)
+        insights["avg_risk"] = _validate_metric(float(df[risk_col].mean()), 0)
         insights["high_risk_count"] = int((df[risk_col] >= 70).sum())
         insights["moderate_risk_count"] = int(((df[risk_col] >= 40) & (df[risk_col] < 70)).sum())
     else:
@@ -1067,19 +1120,22 @@ def _compute_insights(df: pd.DataFrame) -> Dict[str, Any]:
 
     # Inventory
     if "stock_value" in df.columns:
-        insights["total_stock_value"] = round(float(df["stock_value"].sum()), 2)
+        insights["total_stock_value"] = _validate_metric(float(df["stock_value"].sum()), 0)
 
     # Recommendations
     if "recommendation" in df.columns:
         rec_counts = df["recommendation"].value_counts()
         for rec in ["Increase", "Decrease", "Maintain"]:
             insights[f"rec_{rec.lower()}"] = int(rec_counts.get(rec, 0))
-        # Compute lifts
-        if "expected_revenue" in df.columns:
-            current_rev = insights.get("current_revenue", 0)
+
+        # Revenue lift — ONLY compute if current_revenue is valid and non-zero
+        current_rev = insights.get("current_revenue", 0)
+        if current_rev and current_rev > 0 and "expected_revenue" in df.columns:
             insights["revenue_lift"] = round(insights["total_revenue"] - current_rev, 2)
+
+        # Profit lift
         if "expected_profit" in df.columns and "current_price" in df.columns and "cost_price" in df.columns:
-            current_profit = float(((df["current_price"] - df["cost_price"]) * df["sales_volume"]).sum())
+            current_profit = _validate_metric(float(((df["current_price"] - df["cost_price"]) * df["sales_volume"]).sum()), 0)
             insights["profit_lift"] = round(insights["total_profit"] - current_profit, 2)
 
     return insights
@@ -1135,24 +1191,24 @@ def _generate_narrative_insights(df: pd.DataFrame, insights: Dict[str, Any]) -> 
                 f"and should maintain current levels."
             )
 
-    # Revenue concentration
+    # Revenue concentration (safely)
     rev_col = "expected_revenue" if "expected_revenue" in df.columns else "revenue"
     if rev_col in df.columns:
         top10 = df.nlargest(10, rev_col)[rev_col].sum()
         total_rev = insights.get("total_revenue", df[rev_col].sum())
-        if total_rev > 0:
-            conc_pct = top10 / total_rev * 100
-            if conc_pct > 50:
+        rev_share = _safe_revenue_share(top10, total_rev)
+        if rev_share is not None:
+            if rev_share > 50:
                 narratives.append(
                     f"<b>Revenue Concentration:</b> Top 10 products contribute "
-                    f"{conc_pct:.1f}% of total revenue, indicating significant "
+                    f"{rev_share:.1f}% of total revenue, indicating significant "
                     f"revenue concentration risk."
                 )
             else:
                 narratives.append(
                     f"<b>Revenue Distribution:</b> Revenue is reasonably distributed "
                     f"across the portfolio, with top 10 products contributing "
-                    f"{conc_pct:.1f}% of total revenue."
+                    f"{rev_share:.1f}% of total revenue."
                 )
 
     # Margin insights
@@ -1163,8 +1219,6 @@ def _generate_narrative_insights(df: pd.DataFrame, insights: Dict[str, Any]) -> 
             break
     if margin_col:
         avg_margin = insights.get("avg_margin", 0)
-        if margin_col == "profit_margin":
-            avg_margin = avg_margin  # already converted in insights
         if avg_margin < 20:
             narratives.append(
                 f"<b>Margin Pressure:</b> Average margin of {avg_margin:.1f}% is below "
@@ -1197,28 +1251,26 @@ def _generate_narrative_insights(df: pd.DataFrame, insights: Dict[str, Any]) -> 
             )
 
     # Category insights
-    if "category" in df.columns:
+    if "category" in df.columns and rev_col in df.columns:
         cat_count = df["category"].nunique()
         if cat_count > 1:
-            # Find top category by revenue
-            if rev_col in df.columns:
-                top_cat = df.groupby("category")[rev_col].sum().idxmax()
-                top_cat_rev = df.groupby("category")[rev_col].sum().max()
-                total_rev = insights.get("total_revenue", 0)
-                cat_share = top_cat_rev / total_rev * 100 if total_rev > 0 else 0
+            top_cat = df.groupby("category")[rev_col].sum().idxmax()
+            top_cat_rev = df.groupby("category")[rev_col].sum().max()
+            total_rev = insights.get("total_revenue", 0)
+            cat_share = _safe_revenue_share(top_cat_rev, total_rev)
+            if cat_share is not None:
                 narratives.append(
                     f"<b>Category Performance:</b> '{top_cat}' leads with "
                     f"{cat_share:.1f}% of portfolio revenue."
                 )
-
-                # Category with highest risk
-                if "composite_risk_score" in df.columns:
-                    high_risk_cat = df.groupby("category")["composite_risk_score"].mean().idxmax()
-                    high_risk_val = df.groupby("category")["composite_risk_score"].mean().max()
-                    narratives.append(
-                        f"<b>Category Risk:</b> '{high_risk_cat}' exhibits the highest "
-                        f"average risk score ({high_risk_val:.1f}) in the portfolio."
-                    )
+            # Category with highest risk
+            if "composite_risk_score" in df.columns:
+                high_risk_cat = df.groupby("category")["composite_risk_score"].mean().idxmax()
+                high_risk_val = df.groupby("category")["composite_risk_score"].mean().max()
+                narratives.append(
+                    f"<b>Category Risk:</b> '{high_risk_cat}' exhibits the highest "
+                    f"average risk score ({high_risk_val:.1f}) in the portfolio."
+                )
 
     # Inventory/demand observations
     if "demand_trend" in df.columns:
@@ -1284,11 +1336,11 @@ def _build_pdf_cover_page(story: List[Any], styles: Dict[str, ParagraphStyle],
     story.append(Spacer(1, 0.1 * inch))
 
     # KPI row on cover
-    cover_kpis = [
-        ("Total Revenue", f"${insights.get('total_revenue', 0):,.0f}"),
-        ("Total Profit", f"${insights.get('total_profit', 0):,.0f}"),
-        ("Avg Margin", f"{insights.get('avg_margin', 0):.1f}%"),
-    ]
+    cover_kpis = []
+    if insights.get("total_revenue", 0) > 0:
+        cover_kpis.append(("Total Revenue", f"${insights.get('total_revenue', 0):,.0f}"))
+    cover_kpis.append(("Total Profit", f"${insights.get('total_profit', 0):,.0f}"))
+    cover_kpis.append(("Avg Margin", f"{insights.get('avg_margin', 0):.1f}%"))
     if insights.get("high_risk_count", 0) > 0:
         cover_kpis.append(("High Risk", str(insights.get("high_risk_count", 0))))
 
@@ -1358,25 +1410,25 @@ def _build_pdf_executive_summary(story: List[Any], styles: Dict[str, ParagraphSt
 
     # Portfolio health summary
     health_items = []
-    if "total_revenue" in insights:
+    total_rev = insights.get("total_revenue", 0)
+    if total_rev and total_rev > 0:
         health_items.append(
-            f"<b>Portfolio Value:</b> Total revenue of <b>${insights['total_revenue']:,.0f}</b> "
+            f"<b>Portfolio Value:</b> Total revenue of <b>${total_rev:,.0f}</b> "
             f"across {insights.get('total_products', 0)} products."
         )
-    if "total_profit" in insights:
+    total_profit = insights.get("total_profit", 0)
+    if total_profit and total_profit > 0:
         health_items.append(
-            f"<b>Profitability:</b> Total profit estimated at <b>${insights['total_profit']:,.0f}</b> "
+            f"<b>Profitability:</b> Total profit estimated at <b>${total_profit:,.0f}</b> "
             f"with average margin of <b>{insights.get('avg_margin', 0):.1f}%</b>."
         )
-    if "composite_risk_score" in df_global_placeholder if False else True:
-        pass  # We'll add risk summary from insights
-    if "high_risk_count" in insights and insights["high_risk_count"] > 0:
+    high_risk = insights.get("high_risk_count", 0)
+    if high_risk > 0:
         health_items.append(
-            f"<b>Risk Profile:</b> <b>{insights['high_risk_count']}</b> product(s) flagged as "
+            f"<b>Risk Profile:</b> <b>{high_risk}</b> product(s) flagged as "
             f"high-risk, requiring management attention."
         )
 
-    # We need access to df for these narrative insights
     for item in health_items:
         story.append(Paragraph(f"• {item}", styles["BulletText"]))
 
@@ -1387,180 +1439,167 @@ def _build_pdf_executive_summary(story: List[Any], styles: Dict[str, ParagraphSt
         story.append(Paragraph(narrative, styles["BusinessInsight"]))
 
 
-def _build_pdf_kpi_dashboard(story: List[Any], styles: Dict[str, ParagraphStyle],
-                               insights: Dict[str, Any]) -> None:
-    """
-    Build the Executive KPI Dashboard with explanation cards.
-
-    Args:
-        story: ReportLab story list.
-        styles: Paragraph style dict.
-        insights: KPI insights dict.
-    """
-    story.append(Paragraph("2. Executive KPI Dashboard", styles["SectionHeader"]))
-    story.append(HRFlowable(
-        width="100%", thickness=1, color=colors.HexColor(BRAND_PRIMARY),
-        spaceAfter=10, spaceBefore=0,
-    ))
-
-    # Define KPIs with explanations
-    kpi_definitions = [
-        {
-            "value": f"${insights.get('revenue_lift', 0):,.0f}",
-            "label": "Revenue Lift",
-            "explanation": "Expected increase in total revenue after applying recommended pricing changes.",
-            "color": BRAND_ACCENT if insights.get("revenue_lift", 0) >= 0 else BRAND_DANGER,
-        },
-        {
-            "value": f"${insights.get('profit_lift', 0):,.0f}",
-            "label": "Profit Lift",
-            "explanation": "Estimated profit improvement from optimized pricing decisions.",
-            "color": BRAND_ACCENT if insights.get("profit_lift", 0) >= 0 else BRAND_DANGER,
-        },
-        {
-            "value": f"{insights.get('avg_margin', 0):.1f}%",
-            "label": "Average Margin",
-            "explanation": "Average profitability across the analyzed portfolio.",
-            "color": BRAND_PRIMARY,
-        },
-        {
-            "value": f"{insights.get('total_revenue', 0):,.0f}",
-            "label": "Total Revenue",
-            "explanation": f"Aggregate revenue from {insights.get('total_products', 0)} products across all categories.",
-            "color": BRAND_PRIMARY,
-        },
-        {
-            "value": f"${insights.get('total_profit', 0):,.0f}",
-            "label": "Total Profit",
-            "explanation": "Combined profitability after accounting for costs and pricing optimization.",
-            "color": BRAND_SECONDARY,
-        },
-        {
-            "value": str(insights.get("high_risk_count", 0)) + " products",
-            "label": "High Risk Products",
-            "explanation": "Products requiring immediate business attention due to elevated risk scores.",
-            "color": BRAND_DANGER if insights.get("high_risk_count", 0) > 0 else BRAND_ACCENT,
-        },
-    ]
-
-    # Render in 2 rows of 3
-    for row_start in range(0, 6, 3):
-        row_kpis = kpi_definitions[row_start:row_start + 3]
-        row_cells = []
-        for kpi in row_kpis:
-            val_style_name = "KPIValue"
-            cell_text = (
-                f"<b><font size='22' color='{kpi['color']}'>{kpi['value']}</font></b><br/>"
-                f"<font size='9' color='#37474f'><b>{kpi['label']}</b></font><br/>"
-                f"<font size='7' color='#78909c'>{kpi['explanation']}</font>"
-            )
-            row_cells.append(Paragraph(cell_text, styles["Normal"]))
-
-        kpi_table = Table(
-            [row_cells],
-            colWidths=[2.1 * inch] * len(row_cells),
-        )
-        kpi_table.setStyle(TableStyle([
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 10),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
-            ("LEFTPADDING", (0, 0), (-1, -1), 8),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-            ("BOX", (0, 0), (-1, 0), 0.8, colors.HexColor("#e0e0e0")),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#fafafa")),
-        ]))
-        story.append(kpi_table)
-        story.append(Spacer(1, 0.08 * inch))
-    story.append(Spacer(1, 0.1 * inch))
-
-
 def _build_pdf_business_insights(story: List[Any], styles: Dict[str, ParagraphStyle],
                                   df: pd.DataFrame, insights: Dict[str, Any],
                                   narratives: List[str]) -> None:
     """
-    Build detailed business insights section with intelligent commentary.
+    Build business insights with business-focused language, no raw formulas.
 
     Args:
         story: ReportLab story list.
         styles: Paragraph style dict.
         df: Analysis DataFrame.
         insights: KPI insights dict.
-        narratives: Narrative insights (skip first which is intro).
+        narratives: Narrative insights.
     """
-    story.append(Paragraph("3. Business Insights", styles["SectionHeader"]))
+    story.append(Paragraph("2. Business Insights", styles["SectionHeader"]))
     story.append(HRFlowable(
         width="100%", thickness=1, color=colors.HexColor(BRAND_PRIMARY),
         spaceAfter=10, spaceBefore=0,
     ))
 
-    # Pricing insights
-    story.append(Paragraph("Pricing Insights", styles["SubSectionHeader"]))
+    # ── Pricing Position ──
+    story.append(Paragraph("Pricing Position", styles["SubSectionHeader"]))
+
     if "recommendation" in df.columns:
         rec_counts = df["recommendation"].value_counts()
-        total = len(df)
-        inc_pct = rec_counts.get("Increase", 0) / total * 100 if total > 0 else 0
-        dec_pct = rec_counts.get("Decrease", 0) / total * 100 if total > 0 else 0
-        maint_pct = rec_counts.get("Maintain", 0) / total * 100 if total > 0 else 0
+        inc_count = rec_counts.get("Increase", 0)
+        dec_count = rec_counts.get("Decrease", 0)
+        maint_count = rec_counts.get("Maintain", 0)
 
-        insights_text = [
-            f"• <b>{inc_pct:.1f}%</b> of products ({rec_counts.get('Increase', 0)}) identified for "
-            f"<b>price increases</b> — representing direct revenue growth opportunities.",
-            f"• <b>{dec_pct:.1f}%</b> of products ({rec_counts.get('Decrease', 0)}) require "
-            f"<b>price reductions</b> — suggesting competitive pressure or overpricing.",
-            f"• <b>{maint_pct:.1f}%</b> of products ({rec_counts.get('Maintain', 0)}) should "
-            f"<b>maintain current prices</b> — currently well-positioned in market.",
-        ]
-        for t in insights_text:
-            story.append(Paragraph(t, styles["BulletText"]))
+        if inc_count > 0:
+            story.append(Paragraph(
+                f"• <b>{inc_count} products</b> identified as candidates for price increases — "
+                f"these items show room to capture additional value in the market.",
+                styles["BulletText"],
+            ))
+        if dec_count > 0:
+            story.append(Paragraph(
+                f"• <b>{dec_count} products</b> recommended for price reductions — "
+                f"these items face pricing pressure from competition or declining demand.",
+                styles["BulletText"],
+            ))
+        if maint_count > 0:
+            story.append(Paragraph(
+                f"• <b>{maint_count} products</b> are appropriately priced and should maintain "
+                f"current levels — these items are well-positioned in the market.",
+                styles["BulletText"],
+            ))
 
     story.append(Spacer(1, 0.08 * inch))
 
-    # Revenue insights
-    story.append(Paragraph("Revenue Insights", styles["SubSectionHeader"]))
+    # ── Revenue Observations ──
+    story.append(Paragraph("Revenue Observations", styles["SubSectionHeader"]))
     rev_col = "expected_revenue" if "expected_revenue" in df.columns else "revenue"
+
     if rev_col in df.columns:
-        top5 = df.nlargest(5, rev_col)
-        top5_rev = top5[rev_col].sum()
         total_rev = insights.get("total_revenue", 0)
-        top5_pct = top5_rev / total_rev * 100 if total_rev > 0 else 0
-        story.append(Paragraph(
-            f"• Top 5 products contribute <b>{top5_pct:.1f}%</b> of total revenue "
-            f"(${top5_rev:,.0f} of ${total_rev:,.0f}).",
-            styles["BulletText"],
-        ))
-        if top5_pct > 40:
+        # Find strongest categories
+        if "category" in df.columns and total_rev > 0:
+            cat_rev = df.groupby("category")[rev_col].sum().sort_values(ascending=False)
+            if not cat_rev.empty:
+                top_cats = cat_rev.head(3)
+                cats_text = ", ".join([f"<b>{c}</b>" for c in top_cats.index])
+                story.append(Paragraph(
+                    f"• Strongest performing categories: {cats_text}.",
+                    styles["BulletText"],
+                ))
+
+                # Revenue concentration
+                if len(top_cats) > 0:
+                    top3_share = _safe_revenue_share(top_cats.sum(), total_rev)
+                    if top3_share is not None:
+                        if top3_share > 60:
+                            story.append(Paragraph(
+                                f"• Revenue is <b>concentrated</b> in the top categories "
+                                f"(~{top3_share:.0f}% of portfolio). Consider diversifying "
+                                f"across categories to reduce dependency.",
+                                styles["BulletText"],
+                            ))
+                        else:
+                            story.append(Paragraph(
+                                f"• Revenue is <b>reasonably distributed</b> across categories, "
+                                f"with top categories contributing ~{top3_share:.0f}% of total.",
+                                styles["BulletText"],
+                            ))
+
+        # Revenue availability flag
+        if total_rev == 0:
             story.append(Paragraph(
-                "• <b>Revenue concentration risk detected.</b> Diversification strategies "
-                "should be considered to reduce dependency on top performers.",
+                "• Revenue data is currently unavailable for this dataset.",
                 styles["BulletText"],
             ))
 
     story.append(Spacer(1, 0.08 * inch))
 
-    # Category insights
-    if "category" in df.columns and rev_col in df.columns:
-        story.append(Paragraph("Category Insights", styles["SubSectionHeader"]))
-        cat_stats = df.groupby("category").agg(
-            product_count=("product_id", "count"),
-            total_revenue=(rev_col, "sum"),
-            avg_risk=("composite_risk_score", "mean") if "composite_risk_score" in df.columns else ("product_id", "count"),
-        ).reset_index()
-        if "composite_risk_score" not in df.columns:
-            cat_stats = cat_stats.drop(columns=["avg_risk"], errors="ignore")
-
-        total_rev = insights.get("total_revenue", 0)
-        for _, row in cat_stats.iterrows():
-            share = row["total_revenue"] / total_rev * 100 if total_rev > 0 else 0
-            risk_note = ""
-            if "avg_risk" in row and pd.notna(row.get("avg_risk")):
-                risk_level = "elevated" if row["avg_risk"] > 50 else "moderate" if row["avg_risk"] > 30 else "low"
-                risk_note = f" with <b>{risk_level}</b> risk ({row['avg_risk']:.0f})"
+    # ── Risk Snapshot ──
+    story.append(Paragraph("Risk Snapshot", styles["SubSectionHeader"]))
+    risk_col = "composite_risk_score" if "composite_risk_score" in df.columns else None
+    if risk_col:
+        avg_risk = insights.get("avg_risk", 0)
+        high_risk = insights.get("high_risk_count", 0)
+        if avg_risk < 30:
             story.append(Paragraph(
-                f"• <b>{row['category']}</b>: {int(row['product_count'])} products, "
-                f"{share:.1f}% of revenue (${row['total_revenue']:,.0f}){risk_note}.",
+                f"• Overall portfolio stability is <b>strong</b> with an average risk score of {avg_risk:.0f}.",
                 styles["BulletText"],
             ))
+        elif avg_risk < 50:
+            story.append(Paragraph(
+                f"• Portfolio exhibits <b>moderate</b> risk profile (avg: {avg_risk:.0f}). "
+                f"Regular monitoring is recommended.",
+                styles["BulletText"],
+            ))
+        else:
+            story.append(Paragraph(
+                f"• Portfolio risk is <b>elevated</b> (avg: {avg_risk:.0f}). "
+                f"Immediate review of high-risk items is recommended.",
+                styles["BulletText"],
+            ))
+
+        # Risk concentration
+        if risk_col and "category" in df.columns:
+            cat_risk = df.groupby("category")[risk_col].mean().sort_values(ascending=False)
+            if not cat_risk.empty and cat_risk.iloc[0] > 50:
+                story.append(Paragraph(
+                    f"• <b>Attention category:</b> '{cat_risk.index[0]}' shows elevated risk "
+                    f"({cat_risk.iloc[0]:.0f}) compared to portfolio average.",
+                    styles["BulletText"],
+                ))
+
+        if high_risk > 0:
+            story.append(Paragraph(
+                f"• <b>{high_risk} high-risk product(s)</b> identified and require management attention.",
+                styles["BulletText"],
+            ))
+
+    story.append(Spacer(1, 0.08 * inch))
+
+    # ── Inventory & Demand Signals ──
+    if "demand_trend" in df.columns or "inventory_level" in df.columns:
+        story.append(Paragraph("Inventory & Demand Signals", styles["SubSectionHeader"]))
+        if "demand_trend" in df.columns:
+            declining = (df["demand_trend"] < 0.4).sum()
+            growing = (df["demand_trend"] > 0.7).sum()
+            if declining > 0:
+                story.append(Paragraph(
+                    f"• <b>{declining} product(s)</b> show declining demand signals — "
+                    f"review inventory levels and consider promotional strategies.",
+                    styles["BulletText"],
+                ))
+            if growing > 0:
+                story.append(Paragraph(
+                    f"• <b>{growing} product(s)</b> show growing demand — "
+                    f"ensure adequate stock availability.",
+                    styles["BulletText"],
+                ))
+
+        if "inventory_level" in df.columns and "sales_volume" in df.columns:
+            overstocked = df[df["inventory_level"] > df["sales_volume"] * 3].shape[0]
+            if overstocked > 0:
+                story.append(Paragraph(
+                    f"• <b>{overstocked} product(s)</b> appear overstocked relative to sales velocity.",
+                    styles["BulletText"],
+                ))
 
     story.append(Spacer(1, 0.1 * inch))
 
@@ -1578,7 +1617,7 @@ def _build_pdf_pricing_action_plan(story: List[Any], styles: Dict[str, Paragraph
     if "recommendation" not in df.columns:
         return
 
-    story.append(Paragraph("4. Pricing Action Plan", styles["SectionHeader"]))
+    story.append(Paragraph("3. Pricing Action Plan", styles["SectionHeader"]))
     story.append(HRFlowable(
         width="100%", thickness=1, color=colors.HexColor(BRAND_PRIMARY),
         spaceAfter=10, spaceBefore=0,
@@ -1701,7 +1740,7 @@ def _build_pdf_visualizations(story: List[Any], styles: Dict[str, ParagraphStyle
         styles: Paragraph style dict.
         df: Analysis DataFrame.
     """
-    story.append(Paragraph("5. Visual Analytics", styles["SectionHeader"]))
+    story.append(Paragraph("4. Visual Analytics", styles["SectionHeader"]))
     story.append(HRFlowable(
         width="100%", thickness=1, color=colors.HexColor(BRAND_PRIMARY),
         spaceAfter=10, spaceBefore=0,
@@ -1742,6 +1781,8 @@ def _build_pdf_category_performance(story: List[Any], styles: Dict[str, Paragrap
                                      df: pd.DataFrame, insights: Dict[str, Any]) -> None:
     """
     Build a business-focused category performance section with commentary.
+    Only displays Revenue Share if valid total revenue exists.
+    Never shows 0.0% placeholders or broken percentages.
 
     Args:
         story: ReportLab story list.
@@ -1752,7 +1793,7 @@ def _build_pdf_category_performance(story: List[Any], styles: Dict[str, Paragrap
     if "category" not in df.columns:
         return
 
-    story.append(Paragraph("6. Category Performance", styles["SectionHeader"]))
+    story.append(Paragraph("5. Category Performance", styles["SectionHeader"]))
     story.append(HRFlowable(
         width="100%", thickness=1, color=colors.HexColor(BRAND_PRIMARY),
         spaceAfter=10, spaceBefore=0,
@@ -1777,88 +1818,93 @@ def _build_pdf_category_performance(story: List[Any], styles: Dict[str, Paragrap
 
     cat_data = df.groupby("category").agg(agg_dict).reset_index()
     total_rev = insights.get("total_revenue", 0)
+    has_valid_revenue = total_rev and total_rev > 0
 
-    # Build display table
-    headers = ["Category", "Products", "Revenue", "Rev Share", "Avg Margin", "Avg Risk"]
-    if not risk_col:
-        headers = headers[:-1]
+    # Build display table — only include Rev Share column if revenue is valid
+    if has_valid_revenue:
+        headers = ["Category", "Product Count", "Margin", "Risk", "Business Commentary"]
+    else:
+        headers = ["Category", "Product Count", "Margin", "Risk", "Business Commentary"]
 
+    # We'll display as commentary, not raw table with %
     table_data = [headers]
 
     for _, row in cat_data.iterrows():
-        rev_share = row[rev_col] / total_rev * 100 if total_rev > 0 else 0
         margin_val = row.get(margin_col, 0)
         if margin_col == "profit_margin":
             margin_val = margin_val * 100
+        risk_val = row.get(risk_col, 0) if risk_col else None
+
+        # Build business commentary
+        parts = []
+
+        if margin_val > 35:
+            parts.append(f"Strong margins ({margin_val:.0f}%)")
+        elif margin_val > 20:
+            parts.append(f"Healthy margins ({margin_val:.0f}%)")
+        elif margin_val > 10:
+            parts.append(f"Moderate margins ({margin_val:.0f}%)")
+        else:
+            parts.append(f"Low margins ({margin_val:.0f}%) — review needed")
+
+        if risk_val is not None:
+            if risk_val > 50:
+                parts.append(f"Elevated risk ({risk_val:.0f}). Requires attention.")
+            elif risk_val > 30:
+                parts.append(f"Moderate risk ({risk_val:.0f}). Monitor regularly.")
+            else:
+                parts.append(f"Low risk ({risk_val:.0f}). Stable.")
+
+        commentary = " | ".join(parts)
 
         row_data = [
             str(row["category"]),
             str(int(row["product_id"])),
-            f"${row[rev_col]:,.0f}",
-            f"{rev_share:.1f}%",
             f"{margin_val:.1f}%",
+            f"{risk_val:.1f}" if risk_val else "—",
+            commentary,
         ]
-        if risk_col:
-            row_data.append(f"{row.get(risk_col, 0):.1f}")
         table_data.append(row_data)
 
     if len(table_data) > 1:
-        col_widths = [1.2 * inch, 0.6 * inch, 1.0 * inch, 0.7 * inch, 0.8 * inch]
-        if risk_col:
-            col_widths.append(0.7 * inch)
-        # Adjust for remaining space
+        col_widths = [1.2 * inch, 0.7 * inch, 0.7 * inch, 0.6 * inch, 2.1 * inch]
         remaining = 6.5 - sum(col_widths)
-        col_widths[0] += remaining
+        col_widths[0] += remaining * 0.3
+        col_widths[4] += remaining * 0.7
 
         cat_table = Table(table_data, colWidths=col_widths)
         cat_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(BRAND_PRIMARY)),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTSIZE", (0, 0), (-1, 0), 9),
-            ("FONTSIZE", (0, 1), (-1, -1), 8),
+            ("FONTSIZE", (0, 0), (-1, 0), 8),
+            ("FONTSIZE", (0, 1), (-1, -1), 7),
             ("ALIGN", (0, 0), (-1, -1), "CENTER"),
             ("ALIGN", (0, 0), (0, -1), "LEFT"),
+            ("ALIGN", (4, 1), (4, -1), "LEFT"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#e0e0e0")),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1),
              [colors.white, colors.HexColor("#f5f5f5")]),
         ]))
         story.append(cat_table)
         story.append(Spacer(1, 0.1 * inch))
 
-    # Generate commentary for each category
+    # Generate business-friendly commentary for each category (revenue share only if valid)
     story.append(Paragraph("Category Commentary", styles["SubSectionHeader"]))
     for _, row in cat_data.iterrows():
-        margin_val = row.get(margin_col, 0)
-        if margin_col == "profit_margin":
-            margin_val = margin_val * 100
-
-        risk_val = row.get(risk_col, 0) if risk_col else None
-        rev_share = row[rev_col] / total_rev * 100 if total_rev > 0 else 0
         prod_count = int(row["product_id"])
 
-        # Build intelligent commentary
-        parts = [f"<b>{row['category']}</b>"]
-        parts.append(f"contributes {rev_share:.1f}% of portfolio revenue")
+        parts = [f"<b>{row['category']}</b> ({prod_count} products)"]
 
-        if margin_val > 35:
-            parts.append(f"with <b>strong margins</b> ({margin_val:.1f}%)")
-        elif margin_val > 20:
-            parts.append(f"with <b>healthy margins</b> ({margin_val:.1f}%)")
-        elif margin_val > 10:
-            parts.append(f"with <b>moderate margins</b> ({margin_val:.1f}%)")
-        else:
-            parts.append(f"with <b>low margins</b> ({margin_val:.1f}%) — review needed")
-
-        if risk_val is not None:
-            if risk_val > 50:
-                parts.append(f"and <b>elevated risk</b> ({risk_val:.0f}). Requires attention.")
-            elif risk_val > 30:
-                parts.append(f"and <b>moderate risk</b> ({risk_val:.0f}). Monitor regularly.")
-            else:
-                parts.append(f"and <b>low risk</b> ({risk_val:.0f}). Stable category.")
+        # Revenue share — ONLY if valid
+        if has_valid_revenue:
+            rev_share_val = _safe_revenue_share(row[rev_col], total_rev)
+            if rev_share_val is not None:
+                parts.append(f"contributes {rev_share_val:.1f}% of portfolio revenue")
 
         commentary = " ".join(parts)
         story.append(Paragraph(f"• {commentary}", styles["CategoryCommentary"]))
@@ -1875,7 +1921,7 @@ def _build_pdf_risks_and_attention(story: List[Any], styles: Dict[str, Paragraph
         df: Analysis DataFrame.
         insights: KPI insights dict.
     """
-    story.append(Paragraph("7. Top Risks & Attention Areas", styles["SectionHeader"]))
+    story.append(Paragraph("6. Top Risks & Attention Areas", styles["SectionHeader"]))
     story.append(HRFlowable(
         width="100%", thickness=1, color=colors.HexColor(BRAND_DANGER),
         spaceAfter=10, spaceBefore=0,
@@ -1996,7 +2042,7 @@ def _build_pdf_risks_and_attention(story: List[Any], styles: Dict[str, Paragraph
 def _build_pdf_recommendations(story: List[Any], styles: Dict[str, ParagraphStyle],
                                 df: pd.DataFrame, insights: Dict[str, Any]) -> None:
     """
-    Build the Actionable Recommendations section.
+    Build the Actionable Recommendations section with safe, validated calculations.
 
     Args:
         story: ReportLab story list.
@@ -2004,7 +2050,7 @@ def _build_pdf_recommendations(story: List[Any], styles: Dict[str, ParagraphStyl
         df: Analysis DataFrame.
         insights: KPI insights dict.
     """
-    story.append(Paragraph("8. Actionable Recommendations", styles["SectionHeader"]))
+    story.append(Paragraph("7. Actionable Recommendations", styles["SectionHeader"]))
     story.append(HRFlowable(
         width="100%", thickness=1, color=colors.HexColor(BRAND_ACCENT),
         spaceAfter=10, spaceBefore=0,
@@ -2019,13 +2065,16 @@ def _build_pdf_recommendations(story: List[Any], styles: Dict[str, ParagraphStyl
 
     recommendations = []
 
-    # 1. Price increases
+    # 1. Price increases — only if valid data
     if insights.get("rec_increase", 0) > 0:
+        rev_lift = insights.get("revenue_lift", None)
+        profit_lift = insights.get("profit_lift", None)
+        detail = f"{insights['rec_increase']} products identified for price optimization."
+        if rev_lift is not None and rev_lift != 0:
+            detail += f" Estimated revenue lift of ${rev_lift:,.0f}."
         recommendations.append({
             "action": "Implement Price Increases for Selected Products",
-            "detail": f"{insights['rec_increase']} products identified for price optimization. "
-                      f"Estimated revenue lift of ${insights.get('revenue_lift', 0):,.0f} "
-                      f"and profit lift of ${insights.get('profit_lift', 0):,.0f}.",
+            "detail": detail,
             "priority": "High",
             "color": BRAND_ACCENT,
         })
@@ -2099,17 +2148,27 @@ def _build_pdf_recommendations(story: List[Any], styles: Dict[str, ParagraphStyl
                 "color": BRAND_TEAL,
             })
 
-    # Add revenue concentration recommendation
+    # 7. Revenue concentration — SAFELY computed
     rev_col = "expected_revenue" if "expected_revenue" in df.columns else "revenue"
     if rev_col in df.columns:
-        top10_share = df.nlargest(10, rev_col)[rev_col].sum() / insights.get("total_revenue", 1) * 100
-        if top10_share > 50:
+        total_rev = insights.get("total_revenue", 0)
+        if total_rev and total_rev > 0:
+            top10_rev = df.nlargest(10, rev_col)[rev_col].sum()
+            rev_share = _safe_revenue_share(top10_rev, total_rev)
+            if rev_share is not None and rev_share > 50:
+                recommendations.append({
+                    "action": "Diversify Revenue Concentration",
+                    "detail": f"Top 10 products contribute {rev_share:.0f}% of revenue. "
+                              f"Explore growth strategies for mid-tier products to reduce dependency.",
+                    "priority": "Medium",
+                    "color": BRAND_WARNING,
+                })
+        else:
             recommendations.append({
-                "action": "Diversify Revenue Concentration",
-                "detail": f"Top 10 products contribute {top10_share:.0f}% of revenue. "
-                          f"Explore growth strategies for mid-tier products to reduce dependency.",
-                "priority": "Medium",
-                "color": BRAND_WARNING,
+                "action": "Revenue Data Unavailable",
+                "detail": "Revenue concentration insight unavailable for current dataset.",
+                "priority": "Info",
+                "color": BRAND_GREY,
             })
 
     if not recommendations:
@@ -2180,13 +2239,12 @@ def generate_pdf_report(
     Sections:
     1. Cover Page — branding, metadata, quick KPI snapshot
     2. Executive Summary — narrative business summary
-    3. Executive KPI Dashboard — KPI cards with explanations
-    4. Business Insights — pricing, revenue, category insights
-    5. Pricing Action Plan — increase/reduce/maintain groups
-    6. Visual Analytics — pie, bar, donut charts
-    7. Category Performance — table + business commentary
-    8. Top Risks & Attention Areas — risk observations + high-risk table
-    9. Actionable Recommendations — business next steps
+    3. Business Insights — pricing position, revenue observations, risk snapshot, demand signals
+    4. Pricing Action Plan — increase/reduce/maintain groups
+    5. Visual Analytics — pie, bar, donut charts
+    6. Category Performance — table + business commentary
+    7. Top Risks & Attention Areas — risk observations + high-risk table
+    8. Actionable Recommendations — business next steps
 
     Args:
         df: Analysis DataFrame with all computed columns.
@@ -2237,11 +2295,10 @@ def generate_pdf_report(
     df_global_placeholder = None
 
     # =========================================================
-    # PAGE 2: Executive Summary + KPI Dashboard
+    # PAGE 2: Executive Summary
     # =========================================================
     _build_pdf_executive_summary(story, styles, insights, narratives)
     story.append(Spacer(1, 0.15 * inch))
-    _build_pdf_kpi_dashboard(story, styles, insights)
 
     # =========================================================
     # PAGE 3+: Business Insights + Pricing Action Plan

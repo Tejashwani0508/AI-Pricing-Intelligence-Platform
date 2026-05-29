@@ -617,87 +617,194 @@ def _record_notification_history(alert_type: str, status: str, recipient: str, n
 
 
 def build_summary_report_text(df: pd.DataFrame, insights: Dict[str, Any]) -> str:
+    def safe_percentage(part: float, total: float) -> Optional[float]:
+        if total is None or total <= 0:
+            return None
+        return max(0.0, min(100.0, float(part) / float(total) * 100.0))
+
+    dataset_name = getattr(st.session_state, "uploaded_name", "Uploaded dataset") or "Uploaded dataset"
     total_products = int(insights.get("total_products", len(df)))
-    total_categories = int(insights.get("total_categories", 0))
-    revenue = float(insights.get("expected_revenue", insights.get("current_revenue", float(numcol(df, "revenue").sum()))))
-    avg_margin = float(insights.get("avg_margin", 0)) * 100
-    high_risk = int(insights.get("high_risk_count", 0))
-    recommendation_lines = []
 
-    if "recommendation" in df.columns:
-        rec_counts = df["recommendation"].value_counts()
-        for label in ["Increase", "Decrease", "Maintain"]:
-            count = int(rec_counts.get(label, 0))
-            if count:
-                recommendation_lines.append(f"{label}: {count:,} product(s)")
+    revenue_available = "revenue" in df.columns
+    revenue_series = pd.to_numeric(df["revenue"], errors="coerce").fillna(0.0) if revenue_available else pd.Series(dtype="float64")
+    total_revenue = float(revenue_series.sum()) if revenue_available else 0.0
+    revenue_valid = revenue_available and total_revenue > 0
 
-    demand_lines = []
+    recommendation_available = "recommendation" in df.columns
+    rec_counts = df["recommendation"].value_counts() if recommendation_available else pd.Series(dtype="int64")
+    price_increase_count = int(rec_counts.get("Increase", 0))
+    price_reduce_count = int(rec_counts.get("Decrease", 0))
+    maintain_count = int(rec_counts.get("Maintain", 0))
+
+    demand_counts = {}
     if "demand_trend_category" in df.columns:
-        trend_counts = df["demand_trend_category"].fillna("Unknown").value_counts()
-        for label, count in trend_counts.items():
-            demand_lines.append(f"{label}: {count:,} product(s)")
+        demand_counts = df["demand_trend_category"].fillna("Stable").value_counts().to_dict()
+    elif "demand_trend" in df.columns:
+        demand_counts = {
+            "Increasing": int((df["demand_trend"] > 0.55).sum()),
+            "Stable": int(((df["demand_trend"] >= 0.45) & (df["demand_trend"] <= 0.55)).sum()),
+            "Declining": int((df["demand_trend"] < 0.45).sum()),
+        }
 
-    inventory_lines = []
+    inventory_counts = {}
     if "stock_status" in df.columns:
-        stock_counts = df["stock_status"].fillna("Unknown").value_counts()
-        for label, count in stock_counts.items():
-            inventory_lines.append(f"{label}: {count:,} product(s)")
+        inventory_counts = df["stock_status"].fillna("Balanced").value_counts().to_dict()
+    elif "inventory_action" in df.columns:
+        inventory_counts = df["inventory_action"].fillna("Balanced").value_counts().to_dict()
+
+    risk_available = "risk_level" in df.columns
+    low_risk = int(df["risk_level"].isin(["LOW"]).sum()) if risk_available else 0
+    moderate_risk = int(df["risk_level"].isin(["MEDIUM"]).sum()) if risk_available else 0
+    high_risk = int(df["risk_level"].isin(["HIGH", "CRITICAL"]).sum()) if risk_available else 0
+
+    category_available = "category" in df.columns and revenue_valid
+    category_summary = []
+    if category_available:
+        cat_revenue = df.groupby("category")["revenue"].sum().clip(lower=0.0)
+        cat_revenue = cat_revenue[cat_revenue > 0.0]
+        total_category_revenue = float(cat_revenue.sum())
+        if total_category_revenue > 0:
+            for category, value in cat_revenue.sort_values(ascending=False).head(3).items():
+                share = safe_percentage(value, total_revenue)
+                if share is not None:
+                    category_summary.append((category, int(df[df["category"] == category].shape[0]), share))
+
+    top_product_segment = None
+    if revenue_valid and "product_name" in df.columns:
+        best = revenue_series.nlargest(1)
+        if not best.empty:
+            idx = best.index[0]
+            top_share = safe_percentage(best.iloc[0], total_revenue)
+            if top_share is not None:
+                top_product_name = str(df.at[idx, "product_name"] or df.at[idx, "product_id"] if "product_id" in df.columns else "Top product")
+                top_product_segment = (top_product_name, top_share)
+
+    competitor_summary = {}
+    if "overpriced_flag" in df.columns or "underpriced_flag" in df.columns:
+        overpriced = int(df.get("overpriced_flag", pd.Series(dtype=bool)).fillna(False).sum()) if "overpriced_flag" in df.columns else 0
+        underpriced = int(df.get("underpriced_flag", pd.Series(dtype=bool)).fillna(False).sum()) if "underpriced_flag" in df.columns else 0
+        competitor_summary = {
+            "Products priced above market benchmark": overpriced,
+            "Products priced below market benchmark": underpriced,
+        }
 
     lines = [
-        "AI Pricing Platform — Summary Report",
+        "AI Pricing Intelligence Report",
         "",
-        "## Executive Overview",
-        f"- Products analyzed: {total_products:,}",
-        f"- Categories covered: {total_categories:,}",
-        f"- Estimated portfolio revenue: {fmt_money(revenue)}",
-        f"- Average margin: {avg_margin:.1f}%",
-        f"- High risk products: {high_risk:,}",
+        f"Generated On: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Dataset: {dataset_name}",
         "",
-        "## Revenue Summary",
-        f"- Total expected revenue: {fmt_money(revenue)}",
-        "",
-        "## Margin Analysis",
-        f"- Average portfolio margin: {avg_margin:.1f}%",
-        "",
-        "## Pricing Insights",
+        "EXECUTIVE SUMMARY",
+        "This analysis evaluated pricing, demand, inventory, competitor positioning, and risk indicators across the product portfolio.",
+        "Key observations:",
     ]
 
-    if recommendation_lines:
-        for item in recommendation_lines:
-            lines.append(f"- {item}")
+    if price_increase_count:
+        lines.append(f"• {price_increase_count:,} products are recommended for price increase.")
+    if price_reduce_count:
+        lines.append(f"• {price_reduce_count:,} products are recommended for price decrease.")
+    if maintain_count:
+        lines.append(f"• {maintain_count:,} products should maintain current pricing.")
+    if demand_counts:
+        increasing = demand_counts.get("Increasing", demand_counts.get("increasing", 0))
+        stable = demand_counts.get("Stable", demand_counts.get("stable", 0))
+        declining = demand_counts.get("Declining", demand_counts.get("declining", 0))
+        if increasing:
+            lines.append(f"• {increasing:,} products show improving demand trends.")
+        if stable:
+            lines.append(f"• {stable:,} products have stable demand profiles.")
+        if declining:
+            lines.append(f"• {declining:,} products show declining demand signals.")
+    if inventory_counts:
+        if inventory_counts.get("Overstock", inventory_counts.get("overstock", 0)):
+            lines.append(f"• Overstock risk is present in {inventory_counts.get('Overstock', inventory_counts.get('overstock', 0)):,} products.")
+        if inventory_counts.get("Understock", inventory_counts.get("understock", 0)):
+            lines.append(f"• Understock risk is present in {inventory_counts.get('Understock', inventory_counts.get('understock', 0)):,} products.")
+    if risk_available:
+        lines.append(f"• Portfolio risk includes low, moderate, and high risk product segments.")
+    lines.extend([
+        "",
+        "BUSINESS INSIGHTS",
+        "Pricing Actions",
+        f"- Products recommended for price increase: {price_increase_count:,}",
+        f"- Products recommended for price decrease: {price_reduce_count:,}",
+        f"- Products recommended to maintain pricing: {maintain_count:,}",
+        "",
+        "Revenue Observations",
+    ])
+
+    if category_summary:
+        for category, count, share in category_summary:
+            lines.append(f"- {category}: {count:,} products, representing {share:.0f}% of revenue.")
+        if top_product_segment:
+            lines.append(f"- Top product '{top_product_segment[0]}' contributes {top_product_segment[1]:.0f}% of portfolio revenue.")
+        if len(category_summary) and category_summary[0][2] > 50:
+            lines.append("- The portfolio is concentrated in a single category, which may require focused performance monitoring.")
+        else:
+            lines.append("- Revenue is distributed across categories, supporting a balanced portfolio view.")
     else:
-        lines.append("- No pricing recommendation data available.")
-
-    if demand_lines:
-        lines.append("")
-        lines.append("## Demand Highlights")
-        for item in demand_lines:
-            lines.append(f"- {item}")
-
-    if inventory_lines:
-        lines.append("")
-        lines.append("## Inventory Signals")
-        for item in inventory_lines:
-            lines.append(f"- {item}")
+        lines.append("- Selected insight unavailable for current dataset.")
 
     lines.extend([
         "",
-        "## Risk Summary",
-        f"- High risk products identified: {high_risk:,}",
+        "Risk Overview",
+    ])
+    if risk_available:
+        lines.append(f"- Low risk products: {low_risk:,}")
+        lines.append(f"- Moderate risk products: {moderate_risk:,}")
+        lines.append(f"- High risk products: {high_risk:,}")
+        if high_risk > 0:
+            lines.append("- Major attention is recommended for products with high risk exposure.")
+        else:
+            lines.append("- Risk exposure is currently manageable across the portfolio.")
+    else:
+        lines.append("- Selected insight unavailable for current dataset.")
+
+    lines.extend([
+        "",
+        "Inventory & Demand Signals",
     ])
 
-    if "risk_level" in df.columns:
-        risk_counts = df["risk_level"].fillna("Unknown").value_counts()
-        for label, count in risk_counts.items():
-            lines.append(f"- {label}: {count:,} product(s)")
-
-    lines.append("")
-    lines.append("## Recommendations")
-    if recommendation_lines:
-        for item in recommendation_lines:
-            lines.append(f"- {item}")
+    if inventory_counts or demand_counts:
+        if inventory_counts:
+            if inventory_counts.get("Overstock", inventory_counts.get("overstock", 0)):
+                lines.append(f"- Overstock observations: {inventory_counts.get('Overstock', inventory_counts.get('overstock', 0)):,} products.")
+            if inventory_counts.get("Understock", inventory_counts.get("understock", 0)):
+                lines.append(f"- Understock observations: {inventory_counts.get('Understock', inventory_counts.get('understock', 0)):,} products.")
+            if inventory_counts.get("Balanced", inventory_counts.get("balanced", 0)):
+                lines.append(f"- Balanced inventory is present in {inventory_counts.get('Balanced', inventory_counts.get('balanced', 0)):,} products.")
+        if demand_counts:
+            increasing = demand_counts.get("Increasing", demand_counts.get("increasing", 0))
+            stable = demand_counts.get("Stable", demand_counts.get("stable", 0))
+            declining = demand_counts.get("Declining", demand_counts.get("declining", 0))
+            if increasing:
+                lines.append(f"- Increasing demand trends are observed in {increasing:,} products.")
+            if stable:
+                lines.append(f"- Stable demand trends are observed in {stable:,} products.")
+            if declining:
+                lines.append(f"- Declining demand signals are observed in {declining:,} products.")
     else:
-        lines.append("- No recommendations available yet. Generate the report to capture pricing guidance.")
+        lines.append("- Selected insight unavailable for current dataset.")
+
+    if competitor_summary:
+        lines.extend([
+            "",
+            "COMPETITOR ANALYSIS",
+        ])
+        for label, count in competitor_summary.items():
+            lines.append(f"- {label}: {count:,}")
+        lines.append("- Competitor positioning highlights where pricing adjustments can improve market alignment.")
+
+    lines.extend([
+        "",
+        "AI STRATEGIC RECOMMENDATIONS",
+        "Priority Actions:",
+        "1. Optimize pricing on products with strong demand and potential margin improvement.",
+        "2. Adjust inventory levels to reduce holding cost and prevent stock gaps.",
+        "3. Focus on high-potential products where demand is trending upward.",
+        "4. Review competitor-sensitive products for pricing alignment.",
+        "5. Monitor future pricing refresh alerts to maintain competitiveness.",
+    ])
 
     return "\n".join(lines)
 
