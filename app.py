@@ -1834,7 +1834,7 @@ def render_notifications_alerts() -> None:
         st.warning("SMTP configuration missing in .env. Email notification skipped.")
 
     st.markdown("## Price Refresh Validation")
-    with st.expander("Upload Flat File", expanded=True):
+    with st.expander("Upload Refreshed Price File", expanded=True):
         st.caption("Expected columns: product_id (optional), product_name, custom_price")
         refresh_file = st.file_uploader(
             "Upload Refreshed Price File",
@@ -1887,47 +1887,344 @@ def render_notifications_alerts() -> None:
     results_df = st.session_state.price_validation_results
     summary = st.session_state.price_validation_summary or {}
     if isinstance(results_df, pd.DataFrame) and not results_df.empty:
-        st.markdown("#### Comparison Summary")
-        metric_cols = st.columns(5)
-        safe_metric(metric_cols[0], "Total Products Compared", f"{summary.get('total_compared', 0):,}")
-        safe_metric(metric_cols[1], "Matching Prices", f"{summary.get('matching_prices', 0):,}")
-        safe_metric(metric_cols[2], "Price Changes Detected", f"{summary.get('price_changed_count', 0):,}")
-        safe_metric(metric_cols[3], "Missing Products", f"{summary.get('missing_products', 0):,}")
-        safe_metric(metric_cols[4], "New Products", f"{summary.get('new_products', 0):,}")
 
-        st.markdown("#### Comparison Results")
-        display_df = results_df.copy()
-        status_colors = {
-            "NO CHANGE": "background-color: #DCFCE7; color: #166534; font-weight: 700;",
-            "PRICE CHANGED": "background-color: #FFEDD5; color: #9A3412; font-weight: 700;",
-            "MISSING IN REFRESH FILE": "background-color: #FEE2E2; color: #991B1B; font-weight: 700;",
-            "NEW PRODUCT": "background-color: #FEE2E2; color: #991B1B; font-weight: 700;",
-        }
+        # ── Helper: format difference as signed currency ──
+        def _fmt_diff(val):
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return "—"
+            try:
+                v = round(float(val), 2)
+                return f"+${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
+            except (TypeError, ValueError):
+                return "—"
 
-        def _style_price_status(value: Any) -> str:
-            return status_colors.get(str(value), "")
+        def _fmt_pct(val):
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return "—"
+            try:
+                v = round(float(val) * 100, 1)
+                return f"+{v:.1f}%" if v >= 0 else f"{v:.1f}%"
+            except (TypeError, ValueError):
+                return "—"
 
-        styled_df = display_df.style.format({
-            "current_price": _format_price_value,
-            "custom_price": _format_price_value,
-            "difference": _format_difference_value,
-        })
-        try:
-            styled_df = styled_df.map(_style_price_status, subset=["status"])
-        except AttributeError:
-            styled_df = styled_df.applymap(_style_price_status, subset=["status"])
-        try:
-            st.dataframe(styled_df, use_container_width=True, hide_index=True, height=min(620, max(260, 38 * (len(display_df) + 1))))
-        except Exception:
-            show_table(display_df)
+        def _change_direction(val):
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return "No Change", "#94A3B8"
+            try:
+                v = float(val)
+                if v > 0.005:
+                    return "Price Increased ↑", "#059669"
+                elif v < -0.005:
+                    return "Price Reduced ↓", "#2563EB"
+                else:
+                    return "No Change", "#94A3B8"
+            except (TypeError, ValueError):
+                return "No Change", "#94A3B8"
 
-        mismatch_df = detect_price_mismatches(results_df)
-        if not mismatch_df.empty:
+        # ═══════════════════════════════════════════════════════════
+        # 1. PRICE VALIDATION SUMMARY — Professional KPI Cards
+        # ═══════════════════════════════════════════════════════════
+        st.markdown("""
+        <div style="margin-top: 1.5rem; margin-bottom: 0.5rem;">
+            <h3 style="font-size: 1.15rem; font-weight: 700; color: #0F172A; margin: 0;">
+                PRICE VALIDATION SUMMARY
+            </h3>
+            <hr style="border: 0; height: 2px; background: linear-gradient(90deg, #2563EB, #E2E8F0); margin: 0.35rem 0 0.75rem;">
+        </div>
+        """, unsafe_allow_html=True)
+
+        total_compared = summary.get('total_compared', 0)
+        matching = summary.get('matching_prices', 0)
+        changed = summary.get('price_changed_count', 0)
+        missing = summary.get('missing_products', 0)
+        new_products = summary.get('new_products', 0)
+
+        def _safe_card_format(template: str, **kwargs) -> str:
+            """Safely format a card template. Returns fallback text if formatting fails."""
+            try:
+                return template.format(**kwargs)
+            except KeyError as exc:
+                # Attempt a minimal alias fallback for common placeholder naming mismatches.
+                alias_kwargs = kwargs.copy()
+                if "val" in kwargs and "value" not in kwargs:
+                    alias_kwargs["value"] = kwargs["val"]
+                if "value" in kwargs and "val" not in kwargs:
+                    alias_kwargs["val"] = kwargs["value"]
+                try:
+                    return template.format(**alias_kwargs)
+                except Exception:
+                    logger.warning("Card template formatting failed after alias fallback: %s", exc)
+                logger.warning("Card template formatting failed: %s", exc)
+                return "<div style='padding:1rem;text-align:center;color:#94A3B8;font-size:0.8rem;'>Unable to render notification card.</div>"
+            except (ValueError, AttributeError) as exc:
+                logger.warning("Card template formatting failed: %s", exc)
+                return "<div style='padding:1rem;text-align:center;color:#94A3B8;font-size:0.8rem;'>Unable to render notification card.</div>"
+
+        card_css = """
+        <div style="background:{bg}; border:1px solid {border}; border-radius:12px; padding:0.85rem 0.75rem;
+                    text-align:center; box-shadow:0 1px 6px rgba(0,0,0,0.04); height:100%;
+                    display:flex; flex-direction:column; justify-content:center;">
+            <div style="font-size:1.6rem; font-weight:800; color:{text}; line-height:1.2;">{val}</div>
+            <div style="font-size:0.68rem; color:#64748B; font-weight:700; text-transform:uppercase;
+                        letter-spacing:0.06em; margin-top:3px;">{label}</div>
+            <div style="font-size:0.62rem; color:#94A3B8; margin-top:2px;">{desc}</div>
+        </div>
+        """
+
+        metric_cols = st.columns(5, gap="small")
+        for ci, (val, label, desc, text, bg, border) in enumerate([
+            (f"{total_compared:,}", "Products Compared", "Total matched across datasets", "#0F172A", "#FFFFFF", "#E2E8F0"),
+            (f"{matching:,}", "Exact Matches", "Prices identical in both files", "#059669", "#ECFDF5", "#A7F3D0"),
+            (f"{changed:,}", "Price Changes Detected", "Products whose refreshed prices differ", "#D97706", "#FFFBEB", "#FDE68A"),
+            (f"{missing:,}", "Missing in Refresh File", "In analysis but absent from refresh", "#DC2626", "#FEF2F2", "#FECACA"),
+            (f"{new_products:,}", "New Products", "In refresh file but not in analysis", "#DC2626", "#FEF2F2", "#FECACA"),
+        ]):
+            metric_cols[ci].markdown(
+                _safe_card_format(card_css, val=val, label=label, desc=desc, text=text, bg=bg, border=border),
+                unsafe_allow_html=True,
+            )
+
+        refresh_pct = round(changed / total_compared * 100, 1) if total_compared > 0 else 0
+        missing_pct = round(missing / total_compared * 100, 1) if total_compared > 0 else 0
+
+        st.markdown(f"""
+        <div style="background:#FAFBFC; border:1px solid #E5E7EB; border-radius:10px; padding:0.6rem 1rem;
+                    margin:0.5rem 0 1rem; font-size:0.82rem; color:#475569; line-height:1.5;">
+            • <b>{changed:,}</b> products ({refresh_pct:.1f}%) show updated pricing requiring review.<br>
+            • <b>{missing:,}</b> products ({missing_pct:.1f}%) were not included in the refresh file.<br>
+            • Missing products may indicate incomplete refresh uploads or outdated source files.<br>
+            • <b>{matching:,}</b> products have identical prices across both datasets.
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ═══════════════════════════════════════════════════════════
+        # 2. EXPANDABLE SECTIONS — Structured, Clean, Business-Ready
+        # ═══════════════════════════════════════════════════════════
+        st.markdown("""
+        <div style="margin-top: 1rem; margin-bottom: 0.5rem;">
+            <h3 style="font-size: 1.15rem; font-weight: 700; color: #0F172A; margin: 0;">
+                COMPARISON RESULTS
+            </h3>
+            <hr style="border: 0; height: 2px; background: linear-gradient(90deg, #2563EB, #E2E8F0); margin: 0.35rem 0 0.75rem;">
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Safely compute columns for display
+        display_cols = ["product_id", "product_name", "current_price", "custom_price", "difference", "status"]
+        display_df = results_df[display_cols].copy() if all(c in results_df.columns for c in display_cols) else results_df.copy()
+
+        # Add derived column: change_pct
+        display_df["change_pct"] = display_df["difference"] / display_df["current_price"].replace(0, pd.NA)
+        display_df["change_pct"] = display_df["change_pct"].fillna(0.0)
+
+        # Section A: Price Changes
+        changed_df = display_df[display_df["status"] == "PRICE CHANGED"].copy()
+        if not changed_df.empty:
+            with st.expander(f"▼ Price Changes ({len(changed_df)})", expanded=True):
+                changed_display = changed_df.copy()
+                changed_display["direction_label"] = changed_display["difference"].apply(
+                    lambda v: _change_direction(v)[0]
+                )
+                changed_display["direction_color"] = changed_display["difference"].apply(
+                    lambda v: _change_direction(v)[1]
+                )
+                changed_display["current_price_fmt"] = changed_display["current_price"].apply(
+                    lambda v: f"${round(float(v),2):,.2f}" if pd.notna(v) else "—"
+                )
+                changed_display["custom_price_fmt"] = changed_display["custom_price"].apply(
+                    lambda v: f"${round(float(v),2):,.2f}" if pd.notna(v) else "—"
+                )
+                changed_display["diff_fmt"] = changed_display["difference"].apply(_fmt_diff)
+                changed_display["pct_fmt"] = changed_display["change_pct"].apply(_fmt_pct)
+
+                # Render as clean business table
+                for _, row in changed_display.iterrows():
+                    dir_label, dir_color = _change_direction(row["difference"])
+                    st.markdown(f"""
+                    <div style="background:#FFFFFF; border:1px solid #E5E7EB; border-radius:10px;
+                                padding:0.55rem 0.85rem; margin-bottom:0.35rem;
+                                box-shadow:0 1px 4px rgba(0,0,0,0.03);">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <div style="font-size:0.85rem; font-weight:700; color:#0F172A;">
+                                {row.get("product_id", "")} | {row.get("product_name", "Unknown")}
+                            </div>
+                            <span style="display:inline-block; padding:1px 8px; border-radius:999px;
+                                        font-size:0.68rem; font-weight:700; color:#FFFFFF; background:{dir_color};">
+                                {dir_label}
+                            </span>
+                        </div>
+                        <div style="display:flex; gap:1.25rem; margin-top:3px; font-size:0.78rem; color:#64748B;">
+                            <span>Original: <b>{row["current_price_fmt"]}</b></span>
+                            <span>Updated: <b>{row["custom_price_fmt"]}</b></span>
+                            <span>Difference: <b>{row["diff_fmt"]}</b></span>
+                            <span>Change: <b>{row["pct_fmt"]}</b></span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+        # Section B: Missing Products
+        missing_df = display_df[display_df["status"] == "MISSING IN REFRESH FILE"].copy()
+        if not missing_df.empty:
+            with st.expander(f"▼ Missing Products ({len(missing_df)})", expanded=False):
+                st.markdown("""
+                <div style="font-size:0.82rem; color:#64748B; margin-bottom:0.5rem;">
+                    These products exist in the analysis dataset but were not found in the uploaded refresh file.
+                </div>
+                """, unsafe_allow_html=True)
+                missing_display = missing_df.copy()
+                missing_display["current_price_fmt"] = missing_display["current_price"].apply(
+                    lambda v: f"${round(float(v),2):,.2f}" if pd.notna(v) else "—"
+                )
+                # Clean table — no blank custom_price columns
+                rows_html = ""
+                for _, row in missing_display.iterrows():
+                    rows_html += f"""
+                    <div style="display:flex; justify-content:space-between; align-items:center;
+                                padding:0.35rem 0.75rem; border-bottom:1px solid #F1F5F9;
+                                font-size:0.82rem;">
+                        <div><b>{row.get("product_id", "")}</b> | {row.get("product_name", "Unknown")}</div>
+                        <div style="display:flex; gap:1rem; align-items:center;">
+                            <span style="color:#64748B;">Price: <b>{row["current_price_fmt"]}</b></span>
+                            <span style="display:inline-block; padding:1px 8px; border-radius:999px;
+                                        font-size:0.68rem; font-weight:700; color:#FFFFFF; background:#DC2626;">
+                                Missing
+                            </span>
+                        </div>
+                    </div>
+                    """
+                st.markdown(f"""
+                <div style="background:#FFFFFF; border:1px solid #FECACA; border-radius:10px; overflow:hidden;">
+                    {rows_html}
+                </div>
+                """, unsafe_allow_html=True)
+
+        # Section C: No Change / Matching Products
+        matching_df = display_df[display_df["status"] == "NO CHANGE"].copy()
+        if not matching_df.empty:
+            with st.expander(f"▼ Matching Products ({len(matching_df)})", expanded=False):
+                st.markdown("""
+                <div style="font-size:0.82rem; color:#64748B; margin-bottom:0.5rem;">
+                    These products have identical prices in both the analysis dataset and refresh file.
+                </div>
+                """, unsafe_allow_html=True)
+                match_display = matching_df.copy()
+                match_display["current_price_fmt"] = match_display["current_price"].apply(
+                    lambda v: f"${round(float(v),2):,.2f}" if pd.notna(v) else "—"
+                )
+                rows_html = ""
+                for _, row in match_display.head(20).iterrows():
+                    rows_html += f"""
+                    <div style="display:flex; justify-content:space-between; align-items:center;
+                                padding:0.35rem 0.75rem; border-bottom:1px solid #F1F5F9;
+                                font-size:0.82rem;">
+                        <div><b>{row.get("product_id", "")}</b> | {row.get("product_name", "Unknown")}</div>
+                        <div style="display:flex; gap:1rem; align-items:center;">
+                            <span style="color:#64748B;">Price: <b>{row["current_price_fmt"]}</b></span>
+                            <span style="display:inline-block; padding:1px 8px; border-radius:999px;
+                                        font-size:0.68rem; font-weight:700; color:#FFFFFF; background:#059669;">
+                                No Change
+                            </span>
+                        </div>
+                    </div>
+                    """
+                if len(match_display) > 20:
+                    rows_html += f"""
+                    <div style="padding:0.5rem 0.75rem; font-size:0.78rem; color:#94A3B8; text-align:center;">
+                        … and {len(match_display) - 20} more matching products
+                    </div>
+                    """
+                st.markdown(f"""
+                <div style="background:#FFFFFF; border:1px solid #A7F3D0; border-radius:10px; overflow:hidden;">
+                    {rows_html}
+                </div>
+                """, unsafe_allow_html=True)
+
+        # Section D: New Products
+        new_df = display_df[display_df["status"] == "NEW PRODUCT"].copy()
+        if not new_df.empty:
+            with st.expander(f"▼ New Products ({len(new_df)})", expanded=False):
+                st.markdown("""
+                <div style="font-size:0.82rem; color:#64748B; margin-bottom:0.5rem;">
+                    These products appear in the refresh file but were not found in the analysis dataset.
+                </div>
+                """, unsafe_allow_html=True)
+                new_display = new_df.copy()
+                new_display["custom_price_fmt"] = new_display["custom_price"].apply(
+                    lambda v: f"${round(float(v),2):,.2f}" if pd.notna(v) else "—"
+                )
+                rows_html = ""
+                for _, row in new_display.head(20).iterrows():
+                    rows_html += f"""
+                    <div style="display:flex; justify-content:space-between; align-items:center;
+                                padding:0.35rem 0.75rem; border-bottom:1px solid #F1F5F9;
+                                font-size:0.82rem;">
+                        <div><b>{row.get("product_id", "")}</b> | {row.get("product_name", "Unknown")}</div>
+                        <div style="display:flex; gap:1rem; align-items:center;">
+                            <span style="color:#64748B;">Price: <b>{row["custom_price_fmt"]}</b></span>
+                            <span style="display:inline-block; padding:1px 8px; border-radius:999px;
+                                        font-size:0.68rem; font-weight:700; color:#FFFFFF; background:#DC2626;">
+                                New
+                            </span>
+                        </div>
+                    </div>
+                    """
+                st.markdown(f"""
+                <div style="background:#FFFFFF; border:1px solid #FECACA; border-radius:10px; overflow:hidden;">
+                    {rows_html}
+                </div>
+                """, unsafe_allow_html=True)
+
+        # ═══════════════════════════════════════════════════════════
+        # 3. EXPORT BUTTONS
+        # ═══════════════════════════════════════════════════════════
+        st.markdown("<div style='margin-top: 1rem;'></div>", unsafe_allow_html=True)
+        export_col1, export_col2 = st.columns(2)
+        with export_col1:
+            # Clean export: only Product ID, Product Name, Original Price, Updated Price, Difference, % Change, Direction, Status
+            export_df = display_df.copy()
+            export_df["direction"] = export_df["difference"].apply(lambda v: _change_direction(v)[0])
+            export_df["change_pct_display"] = export_df["change_pct"].apply(_fmt_pct)
+            export_df["difference_display"] = export_df["difference"].apply(_fmt_diff)
+            export_df["current_price_display"] = export_df["current_price"].apply(
+                lambda v: f"${round(float(v),2):,.2f}" if pd.notna(v) else "—"
+            )
+            export_df["custom_price_display"] = export_df["custom_price"].apply(
+                lambda v: f"${round(float(v),2):,.2f}" if pd.notna(v) else "—"
+            )
+            csv_export = export_df[["product_id", "product_name", "current_price_display", "custom_price_display",
+                                     "difference_display", "change_pct_display", "direction", "status"]].to_csv(index=False).encode("utf-8")
             st.download_button(
-                "Download Validation Results CSV",
-                data=results_df.to_csv(index=False).encode("utf-8"),
-                file_name="price_refresh_validation_results.csv",
+                "📥 Download Comparison CSV",
+                data=csv_export,
+                file_name="price_refresh_comparison.csv",
                 mime="text/csv",
+                use_container_width=True,
+            )
+        with export_col2:
+            # Validation summary report (text)
+            validation_lines = [
+                "PRICE REFRESH VALIDATION REPORT",
+                f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Analysis Dataset: {st.session_state.uploaded_name or 'Loaded dataset'}",
+                "",
+                "SUMMARY",
+                f"  Products Compared: {total_compared:,}",
+                f"  Price Changes Detected: {changed:,} ({refresh_pct:.1f}%)",
+                f"  Missing in Refresh: {missing:,} ({missing_pct:.1f}%)",
+                f"  Exact Matches: {matching:,}",
+                f"  New Products: {new_products:,}",
+                "",
+                "VALIDATION INSIGHTS",
+                f"  • {changed:,} products show updated pricing requiring review.",
+                f"  • {missing:,} products were not included in the refresh file.",
+                "  • Missing products may indicate incomplete refresh uploads or outdated source files.",
+                f"  • {matching:,} products have identical prices across both datasets.",
+            ]
+            st.download_button(
+                "📄 Download Validation Summary Report",
+                data="\n".join(validation_lines).encode("utf-8"),
+                file_name="price_refresh_validation_summary.txt",
+                mime="text/plain",
                 use_container_width=True,
             )
 
