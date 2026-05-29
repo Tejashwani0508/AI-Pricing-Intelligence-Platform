@@ -9,6 +9,7 @@ optimization, risk scoring, explainability, dashboards, reporting, and chat.
 from __future__ import annotations
 
 import io
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,10 @@ from modules.csv_processor import CSVProcessor, DataValidationError
 from modules.demand_forecaster import DemandForecaster
 from modules.explainability import ExplainabilityEngine
 from modules.inventory_engine import InventoryEngine
+from modules.notification_manager import (
+    load_env_smtp_settings,
+    send_email_alert,
+)
 from modules.pricing_engine import PricingEngine
 from modules.risk_engine import RiskEngine
 from utils.config import AppConfig
@@ -65,6 +70,7 @@ NAV_ITEMS = [
     "Executive Overview", "Data Intake", "Batch Analysis",
     "Pricing Engine", "Demand Forecasting", "Competitor Intelligence",
     "Inventory Optimization", "Risk & Explainability",
+    "Notifications & Alerts",
     "Reports", "Chat Assistant",
 ]
 
@@ -437,6 +443,11 @@ def init_session_state() -> None:
         "analysis_reports": {}, "insights": {}, "alerts": [],
         "chat_history": [], "assistant": AIAssistant(),
         "nav": NAV_ITEMS[0], "last_run_at": None,
+        "price_validation_send_email": True,
+        "notification_history": [],
+        "price_validation_results": None,
+        "price_validation_summary": {},
+        "summary_report": None,
         "uploaded_name": None, "uploaded_bytes_size": None,
         "analysis_error": None, "max_workers": 2, "preview_rows": 50,
     }
@@ -491,6 +502,8 @@ def set_dataset(df: pd.DataFrame, rpt: dict, src: str) -> None:
     st.session_state.analysis_reports = {}
     st.session_state.insights = build_insights(df)
     st.session_state.alerts = []
+    st.session_state.re_pdf = None
+    st.session_state.summary_report = None
     st.session_state.uploaded_name = src
     st.session_state.chat_history = []
     st.session_state.assistant.clear_history()
@@ -572,9 +585,339 @@ def r2d(r: Any) -> Dict[str, Any]:
     return dict(r) if isinstance(r, dict) else {"summary": str(r)}
 
 
+def _get_notification_config() -> Dict[str, Any]:
+    env = load_env_smtp_settings()
+    required_env = ["SMTP_SERVER", "SMTP_PORT", "SMTP_EMAIL", "SMTP_PASSWORD", "RECIPIENT_EMAIL"]
+    try:
+        smtp_port = int(env["smtp_port"])
+    except (ValueError, TypeError):
+        smtp_port = 587
+
+    return {
+        "recipient": env["recipient_email"],
+        "sender": env["smtp_email"],
+        "smtp_server": env["smtp_server"],
+        "smtp_port": smtp_port,
+        "smtp_password": env["smtp_password"],
+        "configured": all(bool(os.getenv(name, "").strip()) for name in required_env),
+    }
+
+
+def _record_notification_history(alert_type: str, status: str, recipient: str, note: str) -> None:
+    entry = {
+        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Alert Type": alert_type,
+        "Status": status,
+        "Recipient": recipient,
+        "Note": note,
+    }
+    history = st.session_state.notification_history or []
+    history.insert(0, entry)
+    st.session_state.notification_history = history[:25]
+
+
+def build_summary_report_text(df: pd.DataFrame, insights: Dict[str, Any]) -> str:
+    total_products = int(insights.get("total_products", len(df)))
+    total_categories = int(insights.get("total_categories", 0))
+    revenue = float(insights.get("expected_revenue", insights.get("current_revenue", float(numcol(df, "revenue").sum()))))
+    avg_margin = float(insights.get("avg_margin", 0)) * 100
+    high_risk = int(insights.get("high_risk_count", 0))
+    recommendation_lines = []
+
+    if "recommendation" in df.columns:
+        rec_counts = df["recommendation"].value_counts()
+        for label in ["Increase", "Decrease", "Maintain"]:
+            count = int(rec_counts.get(label, 0))
+            if count:
+                recommendation_lines.append(f"{label}: {count:,} product(s)")
+
+    demand_lines = []
+    if "demand_trend_category" in df.columns:
+        trend_counts = df["demand_trend_category"].fillna("Unknown").value_counts()
+        for label, count in trend_counts.items():
+            demand_lines.append(f"{label}: {count:,} product(s)")
+
+    inventory_lines = []
+    if "stock_status" in df.columns:
+        stock_counts = df["stock_status"].fillna("Unknown").value_counts()
+        for label, count in stock_counts.items():
+            inventory_lines.append(f"{label}: {count:,} product(s)")
+
+    lines = [
+        "AI Pricing Platform — Summary Report",
+        "",
+        "## Executive Overview",
+        f"- Products analyzed: {total_products:,}",
+        f"- Categories covered: {total_categories:,}",
+        f"- Estimated portfolio revenue: {fmt_money(revenue)}",
+        f"- Average margin: {avg_margin:.1f}%",
+        f"- High risk products: {high_risk:,}",
+        "",
+        "## Revenue Summary",
+        f"- Total expected revenue: {fmt_money(revenue)}",
+        "",
+        "## Margin Analysis",
+        f"- Average portfolio margin: {avg_margin:.1f}%",
+        "",
+        "## Pricing Insights",
+    ]
+
+    if recommendation_lines:
+        for item in recommendation_lines:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- No pricing recommendation data available.")
+
+    if demand_lines:
+        lines.append("")
+        lines.append("## Demand Highlights")
+        for item in demand_lines:
+            lines.append(f"- {item}")
+
+    if inventory_lines:
+        lines.append("")
+        lines.append("## Inventory Signals")
+        for item in inventory_lines:
+            lines.append(f"- {item}")
+
+    lines.extend([
+        "",
+        "## Risk Summary",
+        f"- High risk products identified: {high_risk:,}",
+    ])
+
+    if "risk_level" in df.columns:
+        risk_counts = df["risk_level"].fillna("Unknown").value_counts()
+        for label, count in risk_counts.items():
+            lines.append(f"- {label}: {count:,} product(s)")
+
+    lines.append("")
+    lines.append("## Recommendations")
+    if recommendation_lines:
+        for item in recommendation_lines:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- No recommendations available yet. Generate the report to capture pricing guidance.")
+
+    return "\n".join(lines)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # BATCH PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _normalize_product_name(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _format_price_value(value: Any) -> str:
+    try:
+        if pd.isna(value):
+            return "-"
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _format_difference_value(value: Any) -> str:
+    try:
+        if pd.isna(value):
+            return "-"
+        return f"{float(value):+,.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _load_price_refresh_file(uploaded_file: Any) -> tuple[Optional[pd.DataFrame], str]:
+    if uploaded_file is None:
+        return None, "Upload a refreshed price file first."
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix not in {".csv", ".xlsx"}:
+        return None, "Invalid file format. Upload a CSV or XLSX file."
+    try:
+        raw = uploaded_file.getvalue()
+        if not raw:
+            return None, "Uploaded file is empty."
+        if suffix == ".xlsx":
+            return pd.read_excel(io.BytesIO(raw), engine="openpyxl"), ""
+        return pd.read_csv(io.BytesIO(raw)), ""
+    except Exception as exc:
+        logger.exception("Price refresh file load failed")
+        return None, f"Unable to read refreshed price file: {exc}"
+
+
+def _prepare_price_validation_frame(
+    df: pd.DataFrame,
+    source: str,
+    price_column: str,
+    use_product_id: bool,
+) -> tuple[pd.DataFrame, list[str]]:
+    warnings: list[str] = []
+    required = {"product_name", price_column}
+    if df is None or df.empty:
+        return pd.DataFrame(), [f"{source} file is empty."]
+    missing = sorted(required - set(df.columns))
+    if missing:
+        return pd.DataFrame(), [f"{source} file is missing required columns: {', '.join(missing)}."]
+
+    work = df.copy()
+    if "product_id" not in work.columns:
+        work["product_id"] = pd.NA
+    work = work[["product_id", "product_name", price_column]].copy()
+    work["product_id"] = work["product_id"].astype("string").fillna("").str.strip()
+    work["product_name"] = work["product_name"].astype("string").fillna("").str.strip()
+    work["name_key"] = work["product_name"].map(_normalize_product_name)
+    work[price_column] = pd.to_numeric(work[price_column], errors="coerce")
+
+    invalid_names = int((work["name_key"] == "").sum())
+    invalid_prices = int(work[price_column].isna().sum())
+    if invalid_names:
+        warnings.append(f"{source} file has {invalid_names} row(s) without product_name; those rows were ignored.")
+    if invalid_prices:
+        warnings.append(f"{source} file has {invalid_prices} row(s) with invalid {price_column}; those rows were ignored.")
+    work = work[(work["name_key"] != "") & work[price_column].notna()].copy()
+    if work.empty:
+        return pd.DataFrame(), warnings + [f"{source} file has no valid product rows."]
+    work["_source_row"] = work.index
+
+    if use_product_id:
+        work["_match_key"] = work["product_id"].where(work["product_id"] != "", "name:" + work["name_key"])
+        work["_match_key"] = work["_match_key"].where(work["product_id"] == "", "id:" + work["product_id"])
+    else:
+        work["_match_key"] = "name:" + work["name_key"]
+    duplicate_count = int(work["_match_key"].duplicated(keep="last").sum())
+    if duplicate_count:
+        warnings.append(f"{source} file has {duplicate_count} duplicate product key(s); the last row was used.")
+    return work.drop_duplicates("_match_key", keep="last"), warnings
+
+
+def compare_price_files(analysis_df: pd.DataFrame, refresh_df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, int], list[str]]:
+    use_product_id = "product_id" in analysis_df.columns and "product_id" in refresh_df.columns
+    original, original_warnings = _prepare_price_validation_frame(analysis_df, "Analysis dataset", "current_price", use_product_id)
+    refreshed, refresh_warnings = _prepare_price_validation_frame(refresh_df, "Refreshed price", "custom_price", use_product_id)
+    warnings = original_warnings + refresh_warnings
+    if original.empty or refreshed.empty:
+        return pd.DataFrame(), {}, warnings
+
+    if use_product_id:
+        original_with_id = original[original["product_id"] != ""]
+        refreshed_with_id = refreshed[refreshed["product_id"] != ""]
+        id_matches = original_with_id.merge(
+            refreshed_with_id,
+            on="product_id",
+            how="inner",
+            suffixes=("_original", "_refreshed"),
+        )
+        original_remaining = original[~original["_source_row"].isin(id_matches["_source_row_original"])]
+        refreshed_remaining = refreshed[~refreshed["_source_row"].isin(id_matches["_source_row_refreshed"])]
+        name_matches = original_remaining.merge(
+            refreshed_remaining,
+            on="name_key",
+            how="outer",
+            suffixes=("_original", "_refreshed"),
+            indicator=True,
+        )
+        id_matches["_merge"] = "both"
+        matched = pd.concat([id_matches, name_matches], ignore_index=True, sort=False)
+        matched["product_id_original"] = matched.get("product_id_original", matched.get("product_id", pd.Series(dtype="string"))).fillna(matched.get("product_id", ""))
+        matched["product_id_refreshed"] = matched.get("product_id_refreshed", matched.get("product_id", pd.Series(dtype="string"))).fillna(matched.get("product_id", ""))
+    else:
+        matched = original.merge(
+            refreshed,
+            on="_match_key",
+            how="outer",
+            suffixes=("_original", "_refreshed"),
+            indicator=True,
+        )
+    matched["product_id"] = matched["product_id_original"].fillna(matched["product_id_refreshed"])
+    matched["product_name"] = matched["product_name_original"].fillna(matched["product_name_refreshed"])
+    matched["current_price"] = matched["current_price"]
+    matched["custom_price"] = matched["custom_price"]
+    matched["difference"] = matched["custom_price"] - matched["current_price"]
+
+    matched["status"] = "NO CHANGE"
+    changed_mask = (matched["_merge"] == "both") & (matched["difference"].abs() > 0.000001)
+    matched.loc[changed_mask, "status"] = "PRICE CHANGED"
+    matched.loc[matched["_merge"] == "left_only", "status"] = "MISSING IN REFRESH FILE"
+    matched.loc[matched["_merge"] == "right_only", "status"] = "NEW PRODUCT"
+
+    result = matched[["product_id", "product_name", "current_price", "custom_price", "difference", "status"]].copy()
+    result["product_id"] = result["product_id"].fillna("").astype(str)
+    result["product_name"] = result["product_name"].fillna("Unknown").astype(str)
+    status_counts = result["status"].value_counts()
+    summary = {
+        "total_compared": int(len(result)),
+        "matching_prices": int(status_counts.get("NO CHANGE", 0)),
+        "price_changed_count": int(status_counts.get("PRICE CHANGED", 0)),
+        "missing_products": int(status_counts.get("MISSING IN REFRESH FILE", 0)),
+        "new_products": int(status_counts.get("NEW PRODUCT", 0)),
+    }
+    return result.sort_values(["status", "product_name"]).reset_index(drop=True), summary, warnings
+
+
+def build_alert_dataframe(results_df: pd.DataFrame) -> pd.DataFrame:
+    if results_df is None or results_df.empty:
+        return pd.DataFrame()
+    return results_df[results_df["status"] == "PRICE CHANGED"].copy()
+
+
+def detect_price_mismatches(results_df: pd.DataFrame) -> pd.DataFrame:
+    return build_alert_dataframe(results_df)
+
+
+def _build_price_validation_email_body(summary: Dict[str, int], mismatch_df: pd.DataFrame, source_name: str) -> str:
+    changed_count = summary.get("price_changed_count", 0)
+    lines = [
+        f"{changed_count:,} price changes detected.",
+        "",
+        "Changed Products:",
+    ]
+    if mismatch_df is None or mismatch_df.empty:
+        lines.append("No mismatches detected.")
+    else:
+        for _, row in mismatch_df.head(8).iterrows():
+            lines.append(
+                f"• {row.get('product_name', 'Unknown')} — "
+                f"Old: {_format_price_value(row.get('current_price'))} → "
+                f"New: {_format_price_value(row.get('custom_price'))}"
+            )
+        if len(mismatch_df) > 8:
+            lines.append(f"Additional changed products: {len(mismatch_df) - 8:,}. See attached CSV.")
+    lines.extend([
+        "",
+        "Analysis Dataset:",
+        source_name or "Loaded dataset",
+        "",
+        "Timestamp:",
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    ])
+    return "\n".join(lines)
+
+
+def send_price_validation_email(results_df: pd.DataFrame, summary: Dict[str, int], source_name: str) -> tuple[bool, str]:
+    mismatch_df = build_alert_dataframe(results_df)
+    should_send = summary.get("price_changed_count", 0) > 0
+    cfg = _get_notification_config()
+    if not should_send:
+        _record_notification_history("Price Refresh Validation", "Skipped", cfg.get("recipient", ""), "No mismatches detected")
+        return False, "No mismatches detected."
+    if not cfg["configured"] or not cfg["smtp_server"] or not cfg["smtp_port"] or not cfg["sender"] or not cfg["recipient"] or not cfg["smtp_password"]:
+        _record_notification_history("Price Refresh Validation", "Skipped", cfg.get("recipient", ""), "SMTP settings incomplete")
+        return False, "SMTP configuration missing in .env. Email notification skipped."
+
+    success, status = send_email_alert(
+        "Price Refresh Validation Alert – Price Changes Detected",
+        _build_price_validation_email_body(summary, mismatch_df, source_name),
+        cfg["recipient"],
+        cfg["sender"],
+        cfg["smtp_server"],
+        cfg["smtp_port"],
+        cfg["smtp_password"],
+        attachments=[("price_refresh_validation_results.csv", results_df.to_csv(index=False).encode("utf-8"), "text/csv")],
+    )
+    _record_notification_history("Price Refresh Validation", "Sent" if success else "Failed", cfg["recipient"], status)
+    return success, status
+
 
 def run_batch(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
     pr = st.progress(0, text="Preparing products")
@@ -812,7 +1155,7 @@ def render_sidebar() -> None:
             st.rerun()
 
     if st.sidebar.button("Reset", use_container_width=True):
-        for k in ["raw_df","processed_df","analyzed_df","processor_report","analysis_reports","insights","alerts","chat_history","uploaded_name","last_run_at"]:
+        for k in ["raw_df","processed_df","analyzed_df","processor_report","analysis_reports","insights","alerts","chat_history","re_pdf","summary_report","uploaded_name","last_run_at"]:
             st.session_state[k] = [] if k in {"alerts","chat_history"} else ({} if k in {"analysis_reports","insights"} else None)
         st.session_state.assistant.clear_history(); st.rerun()
     st.sidebar.divider()
@@ -1249,6 +1592,9 @@ def render_reports() -> None:
     df = require_data(prefer_analyzed=True)
     if df is None: return
     ins = st.session_state.insights or build_insights(df)
+    report_pdf_path = st.session_state.get("re_pdf")
+    report_text = st.session_state.get("summary_report")
+
     c1, c2 = st.columns(2)
     c1.download_button("Download CSV", data=df_to_csv(df), file_name="pricing_analysis.csv", mime="text/csv", use_container_width=True)
     if not REPORTING_AVAILABLE:
@@ -1260,9 +1606,43 @@ def render_reports() -> None:
     gen = ReportGenerator(st.session_state.config)
     with c2:
         if st.button("Generate PDF", use_container_width=True):
-            with st.spinner("Generating..."): st.session_state["re_pdf"] = gen.generate_pdf_report(df, ins)
-        if "re_pdf" in st.session_state:
-            with open(st.session_state["re_pdf"],"rb") as f: st.download_button("Download PDF", f.read(), Path(st.session_state["re_pdf"]).name, mime="application/pdf", use_container_width=True)
+            with st.spinner("Generating..."):
+                st.session_state["re_pdf"] = gen.generate_pdf_report(df, ins)
+                st.session_state["summary_report"] = build_summary_report_text(df, ins)
+                report_pdf_path = st.session_state["re_pdf"]
+                report_text = st.session_state["summary_report"]
+
+        if report_pdf_path:
+            with open(report_pdf_path, "rb") as f:
+                st.download_button("Download PDF", f.read(), Path(report_pdf_path).name, mime="application/pdf", use_container_width=True)
+
+        if st.button("Send Summary Report to Email", use_container_width=True):
+            if not report_text:
+                st.warning("Please generate a Summary Report first.")
+            else:
+                cfg = _get_notification_config()
+                if not cfg["configured"] or not cfg["smtp_server"] or not cfg["smtp_port"] or not cfg["sender"] or not cfg["recipient"] or not cfg["smtp_password"]:
+                    st.warning("SMTP configuration missing in .env.")
+                else:
+                    attachments = []
+                    if report_pdf_path and Path(report_pdf_path).exists():
+                        with open(report_pdf_path, "rb") as f:
+                            attachments.append((Path(report_pdf_path).name, f.read(), "application/pdf"))
+                    success, status = send_email_alert(
+                        "AI Pricing Platform — Summary Report",
+                        report_text,
+                        cfg["recipient"],
+                        cfg["sender"],
+                        cfg["smtp_server"],
+                        cfg["smtp_port"],
+                        cfg["smtp_password"],
+                        attachments=attachments,
+                    )
+                    if success:
+                        st.success("Summary report emailed successfully.")
+                    else:
+                        st.error("Unable to send summary report email. Check SMTP configuration.")
+
     if "category" in df.columns:
         st.subheader("Preview")
         show_table(category_preview(df))
@@ -1324,6 +1704,138 @@ def render_chat_assistant() -> None:
         st.rerun()
 
 
+def render_notifications_alerts() -> None:
+    page_hdr("Notifications & Alerts", "Configure notification rules, email delivery, and notification history.")
+
+    st.markdown(
+        "<div style='background:#FFFFFF; border:1px solid #E5E7EB; border-radius:14px; padding:1.25rem; box-shadow:0 2px 10px rgba(15,23,42,0.06); margin-bottom:1rem;'>"
+        "<p style='margin:0 0 0.75rem; color:#475569;'>Manage email alert preferences, frequency, and recipient settings for professional pricing notifications.</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    env_loaded = _get_notification_config().get("configured", False)
+
+    st.markdown("## Alert Settings")
+    st.markdown("#### Custom Price Mismatch Alerts")
+    send_validation_email = st.checkbox(
+        "Send Custom Price Mismatch via Email",
+        key="price_validation_send_email",
+    )
+    st.caption("Receive a concise email summary whenever price refresh validation detects pricing mismatches.")
+    if send_validation_email and not env_loaded:
+        st.warning("SMTP configuration missing in .env. Email notification skipped.")
+
+    st.markdown("## Price Refresh Validation")
+    with st.expander("Upload Flat File", expanded=True):
+        st.caption("Expected columns: product_id (optional), product_name, custom_price")
+        refresh_file = st.file_uploader(
+            "Upload Refreshed Price File",
+            type=["csv", "xlsx"],
+            key="price_refresh_validation_upload",
+        )
+        compare_col, status_col = st.columns([0.35, 0.65])
+        with compare_col:
+            compare_clicked = st.button("Compare Prices", type="primary", use_container_width=True)
+        with status_col:
+            source_name = st.session_state.uploaded_name or "No dataset loaded"
+            st.caption(f"Analysis dataset: {source_name}")
+
+        if compare_clicked:
+            analysis_df = get_df(prefer_analyzed=True)
+            if analysis_df is None or analysis_df.empty:
+                st.warning("Upload and process the main analysis dataset before running price validation.")
+            else:
+                refreshed_df, load_error = _load_price_refresh_file(refresh_file)
+                if load_error:
+                    st.warning(load_error)
+                else:
+                    results_df, summary, warnings = compare_price_files(analysis_df, refreshed_df)
+                    for warning in warnings:
+                        st.warning(warning)
+                    if results_df.empty:
+                        st.warning("No valid price comparison results were generated.")
+                    else:
+                        st.session_state.price_validation_results = results_df
+                        st.session_state.price_validation_summary = summary
+                        mismatch_count = summary.get("price_changed_count", 0)
+                        if mismatch_count:
+                            st.success(f"✓ {mismatch_count:,} price changes detected.")
+                        else:
+                            st.success("✓ No pricing mismatches found.")
+
+                        if send_validation_email and mismatch_count:
+                            success, status = send_price_validation_email(
+                                results_df,
+                                summary,
+                                st.session_state.uploaded_name or "Loaded dataset",
+                            )
+                            if success:
+                                st.success("✓ Summary email sent successfully.")
+                            elif "SMTP configuration missing" in status:
+                                st.warning("⚠ SMTP configuration missing in .env.\nComparison completed without email notification.")
+                            else:
+                                st.error(f"Email notification failed: {status}")
+
+    results_df = st.session_state.price_validation_results
+    summary = st.session_state.price_validation_summary or {}
+    if isinstance(results_df, pd.DataFrame) and not results_df.empty:
+        st.markdown("#### Comparison Summary")
+        metric_cols = st.columns(5)
+        safe_metric(metric_cols[0], "Total Products Compared", f"{summary.get('total_compared', 0):,}")
+        safe_metric(metric_cols[1], "Matching Prices", f"{summary.get('matching_prices', 0):,}")
+        safe_metric(metric_cols[2], "Price Changes Detected", f"{summary.get('price_changed_count', 0):,}")
+        safe_metric(metric_cols[3], "Missing Products", f"{summary.get('missing_products', 0):,}")
+        safe_metric(metric_cols[4], "New Products", f"{summary.get('new_products', 0):,}")
+
+        st.markdown("#### Comparison Results")
+        display_df = results_df.copy()
+        status_colors = {
+            "NO CHANGE": "background-color: #DCFCE7; color: #166534; font-weight: 700;",
+            "PRICE CHANGED": "background-color: #FFEDD5; color: #9A3412; font-weight: 700;",
+            "MISSING IN REFRESH FILE": "background-color: #FEE2E2; color: #991B1B; font-weight: 700;",
+            "NEW PRODUCT": "background-color: #FEE2E2; color: #991B1B; font-weight: 700;",
+        }
+
+        def _style_price_status(value: Any) -> str:
+            return status_colors.get(str(value), "")
+
+        styled_df = display_df.style.format({
+            "current_price": _format_price_value,
+            "custom_price": _format_price_value,
+            "difference": _format_difference_value,
+        })
+        try:
+            styled_df = styled_df.map(_style_price_status, subset=["status"])
+        except AttributeError:
+            styled_df = styled_df.applymap(_style_price_status, subset=["status"])
+        try:
+            st.dataframe(styled_df, use_container_width=True, hide_index=True, height=min(620, max(260, 38 * (len(display_df) + 1))))
+        except Exception:
+            show_table(display_df)
+
+        mismatch_df = detect_price_mismatches(results_df)
+        if not mismatch_df.empty:
+            st.download_button(
+                "Download Validation Results CSV",
+                data=results_df.to_csv(index=False).encode("utf-8"),
+                file_name="price_refresh_validation_results.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    st.markdown("## Notification History")
+    history = st.session_state.notification_history or []
+    if not history:
+        st.info("No notification activity has been recorded yet.")
+    else:
+        history_df = pd.DataFrame(history)
+        if not history_df.empty:
+            show_table(history_df.head(12))
+        else:
+            st.info("No notification activity has been recorded yet.")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1342,6 +1854,7 @@ def main() -> None:
         "Competitor Intelligence": render_competitor_intelligence,
         "Inventory Optimization": render_inventory_optimization,
         "Risk & Explainability": render_risk_explainability,
+        "Notifications & Alerts": render_notifications_alerts,
         "Reports": render_reports,
         "Chat Assistant": render_chat_assistant,
     }
